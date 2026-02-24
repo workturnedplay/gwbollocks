@@ -1,0 +1,9 @@
+todo:
+* empty the proper place of DefaultGateway and DefaultGatewayMetric in Computer\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}\
+* check this folder reg key for other things I should set: Computer\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}\
+* also if DHCP is enabled, then this wouldn't work right, do proper warn and exit or so.
+* warn if legacy Computer\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes isn't empty!
+* proper error checking
+* exit codes
+
+done:
