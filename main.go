@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
+	"log"
+	"math/bits"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -23,24 +28,6 @@ var (
 	procGetIfTable     = iphlpapiDLL.NewProc("GetIfTable")
 	procGetIpAddrTable = iphlpapiDLL.NewProc("GetIpAddrTable")
 )
-
-// // MIB_IPFORWARDROW struct for SetIpForwardEntry
-// type MIB_IPFORWARDROW struct {
-// 	DwForwardDest      uint32
-// 	DwForwardMask      uint32
-// 	DwForwardPolicy    uint32
-// 	DwForwardNextHop   uint32
-// 	DwForwardIfIndex   uint32
-// 	DwForwardType      uint32
-// 	DwForwardProto     uint32
-// 	DwForwardAge       uint32
-// 	DwForwardNextHopAS uint32
-// 	DwForwardMetric1   uint32
-// 	DwForwardMetric2   uint32
-// 	DwForwardMetric3   uint32
-// 	DwForwardMetric4   uint32
-// 	DwForwardMetric5   uint32
-// }
 
 // We define it manually because x/sys/windows does not export the legacy version.
 type MIB_IPFORWARDROW struct {
@@ -160,12 +147,125 @@ func clearPersistentGatewayForIndex(ifIndex uint32) error {
 //		return binary.BigEndian.Uint32(b[:]) // Change to BigEndian
 //	}
 
-// Convert IPv4 string to uint32 in a way that produces Network Byte Order in memory
-func ipv4ToUint32(ip string) uint32 {
+// // Convert IPv4 string to uint32 in a way that produces Network Byte Order in memory
+//
+//	func ipv4ToUint32(ip string) uint32 {
+//		var b [4]byte
+//		fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
+//		// Use LittleEndian so that b[0] (192) ends up at the lowest memory address
+//		return binary.LittleEndian.Uint32(b[:])
+//	}
+//
+//	func ipv4ToUint32(ip string) uint32 {
+//		var b [4]byte
+//		fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
+//		return uint32(b[0])<<24 |
+//			uint32(b[1])<<16 |
+//			uint32(b[2])<<8 |
+//			uint32(b[3])
+//		//192.168.1.1 → 0xC0A80101
+//		//which matches the API’s documented expectation.
+//	}
+//
+
+// // parseIPv4ToUint32 converts dotted IPv4 to a uint32 in network order(aka big endian).
+// // No allocations. Strict validation. Hot-path safe.
+// func parseIPv4ToUint32(ipv4 string) (uint32, error) {
+// 	if len(ipv4) < 7 || len(ipv4) > 15 { // 0.0.0.0 .. 255.255.255.255
+// 		return 0, fmt.Errorf("invalid IPv4 length")
+// 	}
+
+// 	var parts [4]uint32
+// 	part := 0
+// 	var val uint32
+// 	digits := 0
+
+// 	for i := 0; i < len(ipv4); i++ {
+// 		c := ipv4[i]
+
+// 		switch {
+// 		case c >= '0' && c <= '9':
+// 			val = val*10 + uint32(c-'0')
+// 			if val > 255 {
+// 				return 0, fmt.Errorf("octet out of range")
+// 			}
+// 			digits++
+// 			if digits > 3 {
+// 				return 0, fmt.Errorf("octet too long")
+// 			}
+
+// 		case c == '.':
+// 			if digits == 0 {
+// 				return 0, fmt.Errorf("empty octet")
+// 			}
+// 			if part >= 3 {
+// 				return 0, fmt.Errorf("too many octets")
+// 			}
+// 			parts[part] = val
+// 			part++
+// 			val = 0
+// 			digits = 0
+
+// 		default:
+// 			return 0, fmt.Errorf("invalid character in IPv4")
+// 		}
+// 	}
+
+// 	// finalize last octet
+// 	if part != 3 || digits == 0 {
+// 		return 0, fmt.Errorf("invalid IPv4 format")
+// 	}
+// 	parts[3] = val
+
+// 	// network-order numeric value (contract-correct)
+// 	return (parts[0] << 24) |
+// 		(parts[1] << 16) |
+// 		(parts[2] << 8) |
+// 		(parts[3]), nil
+// }
+
+// // big endian
+// func ipv42String(ip uint32) string {
+// 	return fmt.Sprintf("%d.%d.%d.%d",
+// 		byte(ip),
+// 		byte(ip>>8),
+// 		byte(ip>>16),
+// 		byte(ip>>24),
+// 	)
+// }
+
+// // big endian
+// func ipv4StringToUint32(ip string) (uint32, error) {
+// 	var b [4]byte
+// 	n, err := fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
+// 	if err != nil || n != 4 {
+// 		return 0, fmt.Errorf("invalid IPv4: %q", ip)
+// 	}
+// 	return uint32(b[0]) |
+// 			uint32(b[1])<<8 |
+// 			uint32(b[2])<<16 |
+// 			uint32(b[3])<<24,
+// 		nil
+// }
+
+// little endian like Windows
+func ipv4ToUint32LE(ip string) (uint32, error) {
 	var b [4]byte
-	fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
-	// Use LittleEndian so that b[0] (192) ends up at the lowest memory address
-	return binary.LittleEndian.Uint32(b[:])
+	n, err := fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
+	if err != nil || n != 4 {
+		return 0, fmt.Errorf("invalid IPv4: %q", ip)
+	}
+	return binary.LittleEndian.Uint32(b[:]), nil
+}
+
+// little endian like Windows
+func ipv4StringLE(ip uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d",
+		byte(ip),
+		byte(ip>>8),
+		byte(ip>>16),
+		byte(ip>>24),
+	)
 }
 
 type MIB_IPADDRROW struct {
@@ -494,15 +594,204 @@ func deleteDefaultGateway(gw uint32, ifIndex uint32) error {
 	return nil
 }
 
-// Get the best interface index for default route
+// // Get the best interface index for default route
 func getDefaultIfIndex() (uint32, error) {
 	var ifIndex uint32
 	// Use a common IP to find the best local interface
-	ret, _, err := procGetBestInterface.Call(uintptr(ipv4ToUint32("8.8.8.8")), uintptr(unsafe.Pointer(&ifIndex)))
+	const commonIP = "8.8.8.8"
+	//common, err := parseIPv4ToUint32(commonIP)
+	common, err := ipv4ToUint32LE(commonIP)
+	if err != nil {
+		//FIXME: DRY
+		redPrintf("Failed to convert common IP %s into uint32", commonIP)
+		return 0, fmt.Errorf("Failed to convert common IP %s into uint32", commonIP)
+	}
+	ret, _, err := procGetBestInterface.Call(uintptr(common), uintptr(unsafe.Pointer(&ifIndex)))
 	if ret != 0 {
 		return 0, fmt.Errorf("GetBestInterface failed: %d %v %w", ret, err, windows.Errno(ret)) //FIXME
 	}
 	return ifIndex, nil
+}
+
+// formatIPv4 writes the dotted IPv4 form of ip (network order)
+// into dst and returns the number of bytes written.
+//
+// dst must be at least 15 bytes long.
+func formatIPv4(dst []byte, ip uint32) int {
+	_ = dst[14] // bounds check hint
+
+	pos := 0
+	pos += writeDecByte(dst[pos:], byte(ip>>24))
+	dst[pos] = '.'
+	pos++
+
+	pos += writeDecByte(dst[pos:], byte(ip>>16))
+	dst[pos] = '.'
+	pos++
+
+	pos += writeDecByte(dst[pos:], byte(ip>>8))
+	dst[pos] = '.'
+	pos++
+
+	pos += writeDecByte(dst[pos:], byte(ip))
+
+	return pos
+}
+
+// writeDecByte writes v (0–255) in decimal into dst.
+// Returns bytes written (1–3).
+func writeDecByte(dst []byte, v byte) int {
+	if v >= 100 {
+		dst[0] = '0' + v/100
+		dst[1] = '0' + (v/10)%10
+		dst[2] = '0' + v%10
+		return 3
+	}
+	if v >= 10 {
+		dst[0] = '0' + v/10
+		dst[1] = '0' + v%10
+		return 2
+	}
+	dst[0] = '0' + v
+	return 1
+}
+
+// expects big endian
+func ipv4StringBE(ip uint32) string {
+	var buf [15]byte
+	n := formatIPv4(buf[:], ip)
+	return string(buf[:n])
+}
+
+// func findPhysicalInterface() (uint32, error) {
+// 	size := uint32(15000)
+// 	for {
+// 		b := make([]byte, size)
+// 		err := windows.GetAdaptersAddresses(windows.AF_INET, windows.GAA_FLAG_SKIP_ANYCAST, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &size)
+// 		if err == nil {
+// 			addr := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0]))
+// 			for addr != nil {
+// 				// Filter for: Physical (Ethernet/WiFi) + OperStatus Up
+// 				// 6 = Ethernet, 71 = WiFi
+// 				if (addr.IfType == 6 || addr.IfType == 71) && addr.OperStatus == windows.IfOperStatusUp {
+// 					// Ensure it has at least one Unicast address (an IP)
+// 					if addr.FirstUnicastAddress != nil {
+// 						fmt.Printf("Found candidate interface: %s (Index: %d)\n", windows.BytePtrToString(addr.Description), addr.IfIndex)
+// 						return addr.IfIndex, nil
+// 					}
+// 				}
+// 				addr = addr.Next
+// 			}
+// 			return 0, fmt.Errorf("no active physical interface found")
+// 		}
+// 		if err != windows.ERROR_BUFFER_OVERFLOW {
+// 			return 0, err
+// 		}
+// 	}
+// }
+
+// func getIndexFromGUID(savedGUID string) (uint32, error) {
+// 	size := uint32(15000)
+// 	b := make([]byte, size)
+// 	err := windows.GetAdaptersAddresses(windows.AF_INET, 0, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &size)
+// 	if err != nil {
+// 		return 0, err
+// 	}
+
+// 	addr := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0]))
+// 	for addr != nil {
+// 		if windows.BytePtrToString(addr.AdapterName) == savedGUID {
+// 			return addr.IfIndex, nil
+// 		}
+// 		addr = addr.Next
+// 	}
+// 	return 0, fmt.Errorf("interface not found")
+// }
+
+type NetworkAdapter struct {
+	Index       uint32
+	GUID        string
+	Description string
+	IP          string
+}
+
+func getPhysicalAdapters() ([]NetworkAdapter, error) {
+	var adapters []NetworkAdapter
+	size := uint32(15000)
+
+	for {
+		b := make([]byte, size)
+		err := windows.GetAdaptersAddresses(windows.AF_INET, windows.GAA_FLAG_SKIP_ANYCAST, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &size)
+		if err == nil {
+			addr := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0]))
+			for addr != nil {
+				// 6 = Ethernet, 71 = WiFi, and status must be "Up"
+				if (addr.IfType == 6 || addr.IfType == 71) && addr.OperStatus == windows.IfOperStatusUp {
+					ipStr := "No IP"
+					if addr.FirstUnicastAddress != nil {
+						// Extracting the IPv4 string for display
+						sa := (*windows.RawSockaddrInet4)(unsafe.Pointer(addr.FirstUnicastAddress.Address.Sockaddr))
+						ipStr = fmt.Sprintf("%d.%d.%d.%d", sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3])
+					}
+
+					adapters = append(adapters, NetworkAdapter{
+						Index:       addr.IfIndex,
+						GUID:        windows.BytePtrToString(addr.AdapterName),
+						Description: windows.UTF16PtrToString(addr.Description),
+						IP:          ipStr,
+					})
+				}
+				addr = addr.Next
+			}
+			return adapters, nil
+		}
+		if err != windows.ERROR_BUFFER_OVERFLOW {
+			return nil, err
+		}
+	}
+}
+
+func getTargetInterface() (uint32, string) {
+	// 1. Try the "Easy Way" (works if a gateway exists)
+	idx, err := getDefaultIfIndex()
+	if err == nil {
+		// We still need the GUID for registry cleaning
+		guid, _ := getInterfaceGUID(idx)
+		return idx, guid
+	}
+
+	// 2. Error 1231 happened! The routing table is empty.
+	fmt.Println("No existing gateway found (Error 1231). Please select an interface manually.")
+	adapter, err := UserSelectInterface()
+	if err != nil {
+		log.Fatalf("Critical Error: %v", err)
+	}
+
+	// Return the Index for CreateIpForwardEntry and the GUID for registry cleaning
+	return adapter.Index, adapter.GUID
+}
+
+func UserSelectInterface() (NetworkAdapter, error) {
+	adapters, err := getPhysicalAdapters()
+	if err != nil || len(adapters) == 0 {
+		return NetworkAdapter{}, fmt.Errorf("could not find any active physical adapters")
+	}
+
+	fmt.Println("\n--- Available Network Interfaces ---")
+	for i, a := range adapters {
+		fmt.Printf("[%d] %s\n    IP: %s  (Index: %d)\n", i+1, a.Description, a.IP, a.Index)
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("\nSelect the adapter to use for the Gateway: ")
+	input, _ := reader.ReadString('\n')
+	choice, _ := strconv.Atoi(strings.TrimSpace(input))
+
+	if choice < 1 || choice > len(adapters) {
+		return NetworkAdapter{}, fmt.Errorf("invalid selection")
+	}
+
+	return adapters[choice-1], nil
 }
 
 func main() {
@@ -518,11 +807,11 @@ func main() {
 		listInterfaceIPs()
 	}
 
-	ifIndex, err := getDefaultIfIndex()
-	if err != nil {
-		fmt.Println("Cannot get default interface:", err)
-		return
-	}
+	ifIndex, _ := getTargetInterface() //getDefaultIfIndex()
+	// if err != nil {
+	// 	fmt.Println("Cannot get default interface:", err)
+	// 	return
+	// }
 
 	fmt.Printf("default interface index: %d\n", ifIndex)
 
@@ -536,11 +825,36 @@ func main() {
 		// redPrintf("Warning: default gateway already exists on this interface: %d.%d.%d.%d\n",
 		// 	byte(existingGW), byte(existingGW>>8), byte(existingGW>>16), byte(existingGW>>24))
 		// Fixed printing for BigEndian
-		ip := *(*[4]byte)(unsafe.Pointer(&existingGW))
+		// ip := *(*[4]byte)(unsafe.Pointer(&existingGW))
+		// var buf [15]byte
+		// n := formatIPv4(buf[:], existingGW)
+		// ip := string(buf[:n])
 		//fmt.Printf("Current gateway on interface: %d.%d.%d.%d\n",
-		redPrintf("Warning: default gateway already exists on this interface: %d.%d.%d.%d\n",
-			ip[0], ip[1], ip[2], ip[3])
+		// redPrintf("Warning: default gateway already exists on this interface: %d.%d.%d.%d\n",
+		// 	ip[0], ip[1], ip[2], ip[3])
+
+		normalized := bits.ReverseBytes32(existingGW)
+		fmt.Printf("raw:        0x%08X\n", existingGW)
+		fmt.Printf("normalized: 0x%08X\n", normalized)
+		//redPrintf("Warning: default gateway already exists on this interface: %s", ipv4String(existingGW))//wrong order
+		//fmt.Println(ipv4String(normalized))
+		redPrintf("Warning: default gateway already exists on this interface: %s", ipv4StringBE(normalized))
+		redPrintf("Warning: default gateway already exists on this interface: %s", ipv4StringLE(existingGW))
 	}
+
+	// Example gateway, replace with the “real” GW you want
+	//gw := ipv4ToUint32("192.168.1.1")
+	const wantedGW = "192.168.1.1"
+	targetGW, err := ipv4ToUint32LE(wantedGW)
+	//fmt.Printf("targetGW as uint32: %08X\n", targetGW)
+	if err != nil {
+		redPrintf("Failed to convert wanted gw IP %s into uint32", wantedGW)
+		return
+	}
+
+	//ip := *(*[4]byte)(unsafe.Pointer(&targetGW))
+	fmt.Printf("The gateway that we want is %s aka 0x%08X\n",
+		ipv4StringLE(targetGW), targetGW)
 
 	token := windows.GetCurrentProcessToken()
 	//defer token.Close() // Add this, bad 'gemini 3 thinking' lol
@@ -549,14 +863,6 @@ func main() {
 		redPrintf("Must run as admin to effect changes!")
 		return
 	}
-	//fmt.Println("Running elevated?", isAdmin)
-
-	// Example gateway, replace with the “real” GW you want
-	//gw := ipv4ToUint32("192.168.1.1")
-	targetGW := ipv4ToUint32("192.168.1.1")
-	ip := *(*[4]byte)(unsafe.Pointer(&targetGW))
-	fmt.Printf("Gateway to set (uint32): %08X aka %d.%d.%d.%d\n",
-		targetGW, ip[0], ip[1], ip[2], ip[3])
 
 	if err := clearPersistentGatewayForIndex(ifIndex); err != nil {
 		fmt.Println("Failed to delete persistent gateway(ie. the one set in LAN adapter settings, seen by 'route print' under 'Persistent Routes'), err:", err)
