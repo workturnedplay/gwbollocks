@@ -584,6 +584,7 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 			ForwardPolicy:  0,
 			ForwardNextHop: targetGW,
 			ForwardIfIndex: ifIndex,
+			//Type 4 (Indirect): Used for gateways. It tells Windows "to get to the destination, go talk to this other IP."
 			ForwardType:    4,        // MIB_IPROUTE_TYPE_INDIRECT
 			ForwardProto:   3,        // MIB_IPPROTO_NETMGMT
 			ForwardMetric1: ifMetric, // can't be -1(err 160) or 0(err 87) or 1(err 160)
@@ -605,6 +606,7 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 		ForwardDest:    targetGW,
 		ForwardMask:    0xFFFFFFFF, // Exact match for the GW IP
 		ForwardIfIndex: ifIndex,
+		//Type 3 (Direct): Used for the local wire. It tells Windows "the destination is physically right there on the cable; just shout its name (ARP)."
 		ForwardType:    3, // MIB_IPROUTE_TYPE_DIRECT (Tell Windows it's on the wire!)
 		ForwardProto:   3, // MIB_IPPROTO_NETMGMT
 		ForwardNextHop: 0, // No next hop needed for a direct wire route
@@ -956,21 +958,21 @@ func main() {
 	}
 
 	defer func() {
-		if removeActiveGateway {
-			if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
-				redPrintf("Failed to delete gateway: %v\n", err)
-			} else {
-				fmt.Println("Default gateway removed, internet access should be off then.")
-			}
-		}
-	}()
-
-	defer func() {
 		if removeDirectGWRoute {
 			if err := deleteDirectRoute(targetGW, ifIndex); err != nil {
 				redPrintf("Failed to delete the on-link gateway: %v\n", err)
 			} else {
 				fmt.Println("on-link direct route to gateway removed")
+			}
+		}
+	}()
+
+	defer func() {
+		if removeActiveGateway {
+			if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
+				redPrintf("Failed to delete gateway: %v\n", err)
+			} else {
+				fmt.Println("Default gateway removed, internet access should be off then.")
 			}
 		}
 	}()
