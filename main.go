@@ -599,16 +599,55 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 		printForwardRow("newRow:", newRow)
 	}
 
+	// Add a specific route to the GATEWAY ITSELF first, telling Windows it's "On-Link"
+	// Route: [TargetGW] Mask 255.255.255.255 -> Interface Index (No Gateway)
+	row := MIB_IPFORWARDROW{
+		ForwardDest:    targetGW,
+		ForwardMask:    0xFFFFFFFF, // Exact match for the GW IP
+		ForwardIfIndex: ifIndex,
+		ForwardType:    3, // MIB_IPROUTE_TYPE_DIRECT (Tell Windows it's on the wire!)
+		ForwardProto:   3, // MIB_IPPROTO_NETMGMT
+		ForwardNextHop: 0, // No next hop needed for a direct wire route
+		// ... metrics ...
+		ForwardMetric1: ifMetric,
+		ForwardMetric2: ^uint32(0), // -1
+		ForwardMetric3: ^uint32(0), // -1
+		ForwardMetric4: ^uint32(0), // -1
+		ForwardMetric5: ^uint32(0), // -1
+	}
+	ret, _, _ = procCreateIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
+	if ret != 0 {
+		redPrintf("CreateIpForwardEntry for gw being on-link failed: %v (code %d)\n", windows.Errno(ret), ret)
+		//continue
+	}
+	if ret == 0 || ret == 5010 {
+		// The object already exists. (code 5010)
+		removeDirectGWRoute = true
+	}
 	// 3. Create the route
 	ret, _, _ = procCreateIpForwardEntry.Call(uintptr(unsafe.Pointer(&newRow)))
 	if ret != 0 {
+		if ret == 5010 {
+			// The object already exists. (code 5010)
+			redPrintf("Unexpectedly gw already exists(but shoulda been deleted before by our code): %v (code %d)\n", windows.Errno(ret), ret)
+			removeActiveGateway = true
+		}
 		return fmt.Errorf("CreateIpForwardEntry failed: %w (code %d)", windows.Errno(ret), ret)
 	}
+	// 0 if here
+	removeActiveGateway = true
 	return nil
 }
 
+var removeActiveGateway, removeDirectGWRoute bool = false, false
+
 // Delete default gateway
 func deleteDefaultGateway(gw uint32, ifIndex uint32) error {
+	/*
+		The reason deleteDefaultGateway worked with Metric1: 1 even if you created it with 281 is because DeleteIpForwardEntry
+		is actually quite "fuzzy." It primarily looks for a match on Destination, Mask, NextHop, and IfIndex. As long as those match,
+		it usually ignores the metric during deletion unless you have multiple identical routes with different metrics.
+	*/
 	row := MIB_IPFORWARDROW{
 		ForwardDest:    0,
 		ForwardMask:    0,
@@ -626,6 +665,30 @@ func deleteDefaultGateway(gw uint32, ifIndex uint32) error {
 	if ret != 0 {
 		return fmt.Errorf("DeleteIpForwardEntry failed, ret=%d, err(wrong):'%v', errno(correct):'%w'",
 			ret, err, windows.Errno(ret))
+	}
+	return nil
+}
+
+func deleteDirectRoute(targetGW uint32, ifIndex uint32) error {
+	row := MIB_IPFORWARDROW{
+		ForwardDest:    targetGW,   // The specific IP of the gateway
+		ForwardMask:    0xFFFFFFFF, // The /32 mask used during creation
+		ForwardNextHop: 0,          // Direct routes have no next hop
+		ForwardIfIndex: ifIndex,
+		ForwardType:    3, // MIB_IPROUTE_TYPE_DIRECT
+		ForwardProto:   3, // MIB_IPPROTO_NETMGMT
+		ForwardMetric1: 1, // Metric 1 is usually enough for a match
+		ForwardMetric2: ^uint32(0),
+		ForwardMetric3: ^uint32(0),
+		ForwardMetric4: ^uint32(0),
+		ForwardMetric5: ^uint32(0),
+	}
+
+	ret, _, _ := procDeleteIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
+
+	// 1168 is ERROR_NOT_FOUND. If it's already gone, we don't care.
+	if ret != 0 { //&& ret != 1168 {
+		return fmt.Errorf("DeleteDirectRoute failed: ret=%d (%w)", ret, windows.Errno(ret))
 	}
 	return nil
 }
@@ -892,6 +955,26 @@ func main() {
 		return
 	}
 
+	defer func() {
+		if removeActiveGateway {
+			if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
+				redPrintf("Failed to delete gateway: %v\n", err)
+			} else {
+				fmt.Println("Default gateway removed, internet access should be off then.")
+			}
+		}
+	}()
+
+	defer func() {
+		if removeDirectGWRoute {
+			if err := deleteDirectRoute(targetGW, ifIndex); err != nil {
+				redPrintf("Failed to delete the on-link gateway: %v\n", err)
+			} else {
+				fmt.Println("on-link direct route to gateway removed")
+			}
+		}
+	}()
+
 	//ip := *(*[4]byte)(unsafe.Pointer(&targetGW))
 	fmt.Printf("The gateway that we want is %s aka 0x%08X\n",
 		ipv4StringLE(targetGW), targetGW)
@@ -920,9 +1003,4 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 
-	if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
-		redPrintf("Failed to delete gateway: %v\n", err)
-	} else {
-		fmt.Println("Default gateway removed, internet access should be off then.")
-	}
 }
