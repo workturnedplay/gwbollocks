@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	//"log"
 	//"math/bits"
@@ -457,25 +458,58 @@ const (
 	FOREGROUND_GREEN     = 0x0002
 	FOREGROUND_BLUE      = 0x0001
 	FOREGROUND_INTENSITY = 0x0008
+
+	// derived colors
+	FOREGROUND_YELLOW        = FOREGROUND_RED | FOREGROUND_GREEN
+	FOREGROUND_BRIGHT_YELLOW = FOREGROUND_YELLOW | FOREGROUND_INTENSITY
+
+	FOREGROUND_MAGENTA        = FOREGROUND_RED | FOREGROUND_BLUE
+	FOREGROUND_BRIGHT_MAGENTA = FOREGROUND_MAGENTA | FOREGROUND_INTENSITY
 )
 
-func redPrintf(msg string, a ...interface{}) {
+func colorPrintf(color uintptr, msg string, a ...any) {
 	//fmt.Printf("\x1b[31m"+msg+"\x1b[0m\n", a...) // XXX: this doesn't work in admin cmd.exe, it's shown raw.
-	h := windows.Stdout
-	// get stdout handle
-	h2, _, _ := procGetStdHandle.Call(uintptr(STD_OUTPUT_HANDLE))
-	if uintptr(h) != h2 {
-		panic(fmt.Sprintf("unexpected diff. handles for stdout: %d,%d\n", h, h2))
-	}
+	hStdout := windows.Stdout
+	// h2, _, callErr := procGetStdHandle.Call(uintptr(STD_OUTPUT_HANDLE))
+	// handle := windows.Handle(h2)
+	// if handle == 0 || handle == windows.InvalidHandle {
+	// 	// callErr is only meaningful on failure
+	// 	if callErr != nil && callErr != windows.ERROR_SUCCESS {
+	// 		panic(fmt.Errorf("GetStdHandle failed: %w", callErr))
+	// 	}
+	// 	panic(fmt.Errorf("GetStdHandle returned invalid handle"))
+	// }
+	// if hStdout != handle {
+	// 	panic(fmt.Errorf("unexpected diff. handles for stdout: %d,%d\n", hStdout, handle))
+	// }
 	var csbi windows.ConsoleScreenBufferInfo
-	windows.GetConsoleScreenBufferInfo(h, &csbi)
+	windows.GetConsoleScreenBufferInfo(hStdout, &csbi)
 	origAttr := csbi.Attributes
 
+	h2 := uintptr(hStdout)
 	//set red
-	procSetConsoleTextAttribute.Call(h2, FOREGROUND_RED|FOREGROUND_INTENSITY)
-	fmt.Printf(msg+"\n", a...)
+	procSetConsoleTextAttribute.Call(h2, color)
+	fmt.Printf(msg, a...)
 	//restore
 	procSetConsoleTextAttribute.Call(h2, uintptr(origAttr))
+}
+
+func greenPrintf(msg string, a ...any) {
+	colorPrintf(FOREGROUND_GREEN|FOREGROUND_INTENSITY, msg, a...)
+}
+
+func redPrintf(msg string, a ...any) {
+	colorPrintf(FOREGROUND_RED|FOREGROUND_INTENSITY, msg, a...)
+}
+
+func cautionPrintf(msg string, a ...any) {
+	colorPrintf(FOREGROUND_BRIGHT_MAGENTA, msg, a...)
+}
+
+// indicates the resulting state was already present, eg. deleting a gw, was already deleted by something else
+// but could be an error if this wasn't expected.
+func yellowPrintf(msg string, a ...any) {
+	colorPrintf(FOREGROUND_BRIGHT_YELLOW, msg, a...)
 }
 
 // // Map common IP Helper error codes to human-readable text
@@ -587,11 +621,11 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 
 	if existingRow != nil {
 		// 2a. Safest approach: Clone the OS parameters and just swap the IP
-		printForwardRow("existingRow before:", *existingRow)
+		//printForwardRow("existingRow before:", *existingRow)
 		newRow = *existingRow
 		newRow.ForwardNextHop = targetGW
 		newRow.ForwardAge = 0
-		printForwardRow("existingRow after:", newRow)
+		//printForwardRow("existingRow after:", newRow)
 	} else {
 		// 2b. Fallback if no gateway existed at all
 		newRow = MIB_IPFORWARDROW{
@@ -613,7 +647,7 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 			ForwardMetric4: ^uint32(0), // -1
 			ForwardMetric5: ^uint32(0), // -1
 		}
-		printForwardRow("newRow:", newRow)
+		//printForwardRow("newRow:", newRow)
 	}
 
 	// Add a specific route to the GATEWAY ITSELF first, telling Windows it's "On-Link"
@@ -641,9 +675,17 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 	removeDirectGWRoute = true // rather fail to delete it than miss deleting it due to race.
 	ret, _, _ = procCreateIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
 	if ret != 0 {
-		redPrintf("CreateIpForwardEntry for gw being on-link failed: %v (code %d)\n", windows.Errno(ret), ret)
+		errNoRet := windows.Errno(ret)
 		//continue because it works w/o this anyway!
-		removeDirectGWRoute = false
+		if ret == 5010 {
+			// if The object already exists. (code 5010)
+			yellowPrintf("The entry for on-link gw already existed, err: %v (code %d)", errNoRet, ret)
+		} else {
+			// if not: The object already exists. (code 5010)
+			//then nothing to remove as it failed to add it
+			removeDirectGWRoute = false
+			redPrintf("CreateIpForwardEntry for gw being on-link failed: %v (code %d)\n", errNoRet, ret)
+		}
 	}
 	// if ret == 0 || ret == 5010 {
 	// 	// The object already exists. (code 5010)
@@ -657,8 +699,9 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 			// The object already exists. (code 5010)
 			redPrintf("Unexpectedly gw already exists(but shoulda been deleted before by our code): %v (code %d)\n", windows.Errno(ret), ret)
 			//removeActiveGateway = true
+		} else {
+			removeActiveGateway = false
 		}
-		removeActiveGateway = false
 		return fmt.Errorf("CreateIpForwardEntry failed: %w (code %d)", windows.Errno(ret), ret)
 	}
 	// 0 if here
@@ -924,6 +967,56 @@ func UserSelectInterface() (NetworkAdapter, error) {
 	return adapters[choice-1], nil
 }
 
+const gwFile = "gateway.cfg"
+
+func getWantedGW() (string, error) {
+	file, err := os.Open(gwFile)
+	if err != nil {
+		return "", fmt.Errorf("Error opening file '%s', err:'%w' Create the file and store an IP like 192.168.1.1 on a line. # are comments (inline too)\n", gwFile, err)
+	}
+	defer file.Close()
+
+	var foundIPs []string
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// 1. Strip comments
+		if commentIdx := strings.Index(line, "#"); commentIdx != -1 {
+			line = line[:commentIdx]
+		}
+
+		// 2. Clean up whitespace
+		line = strings.TrimSpace(line)
+
+		// 3. Collect if not empty
+		if line != "" {
+			foundIPs = append(foundIPs, line)
+		}
+	}
+
+	// Logic Check
+	switch len(foundIPs) {
+	case 0:
+		return "", fmt.Errorf("Error: No gateway IP found in gateway.cfg")
+	case 1:
+		gatewayIP := foundIPs[0]
+		return gatewayIP, nil
+	default:
+		// // 4. Handle multiple IPs found
+		// fmt.Printf("Error: Multiple IP entries found in gateway.cfg:\n")
+		// for _, ip := range foundIPs {
+		// 	fmt.Printf("  - %s\n", ip)
+		// }
+		// fmt.Println("Please ensure only one IP is active (comment out the rest).")
+		//if len(foundIPs) > 1 {
+		return "", fmt.Errorf("multiple IP entries found: [%s]. Please ensure only one is active",
+			strings.Join(foundIPs, ", "))
+		//}
+	}
+}
+
 func main() {
 	defer func() {
 		fmt.Printf("Press Enter to exit ")
@@ -973,8 +1066,13 @@ func main() {
 	}
 
 	// Example gateway, replace with the “real” GW you want
-	//gw := ipv4ToUint32("192.168.1.1")
-	const wantedGW = "192.168.1.1"
+	wantedGW, err := getWantedGW()
+	if err != nil {
+		redPrintf("need to know which gw to set: %v", err)
+		return
+	} else {
+		fmt.Printf("Read gw '%s' from file '%s'\n", wantedGW, gwFile)
+	}
 	targetGW, err := ipv4ToUint32LE(wantedGW)
 	//fmt.Printf("targetGW as uint32: %08X\n", targetGW)
 	if err != nil {
@@ -985,20 +1083,32 @@ func main() {
 	defer func() {
 		if removeDirectGWRoute {
 			if err := deleteDirectRoute(targetGW, ifIndex); err != nil {
-				redPrintf("Failed to delete the on-link gateway: %v\n", err)
+				if errors.Is(err, windows.Errno(1168)) {
+					yellowPrintf("Apparently the on-link gateway entry was already removed, possibly by another instance u ran in parallel and exited! err: %v\n", err)
+				} else {
+					redPrintf("Failed to delete the on-link gateway: %v\n", err)
+				}
 			} else {
-				fmt.Println("on-link direct route to gateway removed")
+				greenPrintf("on-link direct route to gateway removed\n")
 			}
+		} else {
+			redPrintf("Not removing on-link gateway (wasn't set? run: route print -4)")
 		}
 	}()
 
 	defer func() {
 		if removeActiveGateway {
 			if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
-				redPrintf("Failed to delete gateway: %v\n", err)
+				if errors.Is(err, windows.Errno(1168)) {
+					yellowPrintf("Apparently the gateway was already removed, possibly by another instance u ran in parallel and exited! err: %v\n", err)
+				} else {
+					redPrintf("Failed to delete gateway: %v\n", err)
+				}
 			} else {
-				fmt.Println("Default gateway removed, internet access should be off then.")
+				greenPrintf("Default gateway removed, internet access should be off then.\n")
 			}
+		} else {
+			redPrintf("Not removing gateway (wasn't set? run: route print -4)")
 		}
 	}()
 
@@ -1025,8 +1135,8 @@ func main() {
 	}
 
 	// 3. THE WAITING ROOM
-	fmt.Println("\n>>> Gateway is ACTIVE. Internet is routed.")
-	fmt.Println(">>> Press Ctrl+C to disconnect and cleanup.")
+	cautionPrintf("\n>>> Gateway is ACTIVE. Internet is routed.\n")
+	cautionPrintf(">>> Press Ctrl+C to disconnect and cleanup.\n")
 	//fmt.Println("Default gateway set. Press Ctrl+C to exit and remove it.")
 
 	// Catch Ctrl+C to remove gateway on exit
