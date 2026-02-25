@@ -1,3 +1,19 @@
+//go:build windows
+
+// Copyright 2026 workturnedplay
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -617,27 +633,36 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 		ForwardMetric4: ^uint32(0), // -1
 		ForwardMetric5: ^uint32(0), // -1
 	}
+
+	//Remove a theoretical race by setting this to true beforehand
+	// if it fails then set it to false
+	// if it hits the race then at worst the deletion fails, but it won't exit, it will get to next defer in worst case
+	//Same thing for the other bool below.
+	removeDirectGWRoute = true // rather fail to delete it than miss deleting it due to race.
 	ret, _, _ = procCreateIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
 	if ret != 0 {
 		redPrintf("CreateIpForwardEntry for gw being on-link failed: %v (code %d)\n", windows.Errno(ret), ret)
-		//continue
+		//continue because it works w/o this anyway!
+		removeDirectGWRoute = false
 	}
-	if ret == 0 || ret == 5010 {
-		// The object already exists. (code 5010)
-		removeDirectGWRoute = true
-	}
+	// if ret == 0 || ret == 5010 {
+	// 	// The object already exists. (code 5010)
+	// 	removeDirectGWRoute = true
+	// }
 	// 3. Create the route
+	removeActiveGateway = true // rather fail to delete it than miss deleting it due to race.
 	ret, _, _ = procCreateIpForwardEntry.Call(uintptr(unsafe.Pointer(&newRow)))
 	if ret != 0 {
 		if ret == 5010 {
 			// The object already exists. (code 5010)
 			redPrintf("Unexpectedly gw already exists(but shoulda been deleted before by our code): %v (code %d)\n", windows.Errno(ret), ret)
-			removeActiveGateway = true
+			//removeActiveGateway = true
 		}
+		removeActiveGateway = false
 		return fmt.Errorf("CreateIpForwardEntry failed: %w (code %d)", windows.Errno(ret), ret)
 	}
 	// 0 if here
-	removeActiveGateway = true
+	//removeActiveGateway = true
 	return nil
 }
 
@@ -1004,5 +1029,6 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
-
+	fmt.Println("\n[!] Shutdown signal received. Cleaning up routes...")
+	// The defers will now trigger as main() finishes after this point.
 }
