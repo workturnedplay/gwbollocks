@@ -20,7 +20,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
-	"log"
+	//"log"
 	//"math/bits"
 	"os"
 	"os/signal"
@@ -877,30 +877,30 @@ func getPhysicalAdapters() ([]NetworkAdapter, error) {
 	}
 }
 
-func getTargetInterface() (uint32, string) {
+func getTargetInterface() (uint32, string, error) {
 	// 1. Try the "Easy Way" (works if a gateway exists)
 	idx, err := getDefaultIfIndex()
 	if err == nil {
 		// We still need the GUID for registry cleaning
 		guid, _ := getInterfaceGUID(idx)
-		return idx, guid
+		return idx, guid, nil
 	}
 
 	// 2. Error 1231 happened! The routing table is empty.
-	fmt.Println("No existing gateway found (Error 1231)")
+	fmt.Println("No existing gateway found, this is better.")
 	adapter, err := UserSelectInterface()
 	if err != nil {
-		log.Fatalf("Critical Error: %v", err)
+		return 0, "", fmt.Errorf("failed selecting adapter: %w", err)
 	}
 
 	// Return the Index for CreateIpForwardEntry and the GUID for registry cleaning
-	return adapter.Index, adapter.GUID
+	return adapter.Index, adapter.GUID, nil
 }
 
 func UserSelectInterface() (NetworkAdapter, error) {
 	adapters, err := getPhysicalAdapters()
 	if err != nil || len(adapters) == 0 {
-		return NetworkAdapter{}, fmt.Errorf("could not find any active physical adapters")
+		return NetworkAdapter{}, fmt.Errorf("could not find any active physical adapters (ie. LAN cable not plugged in)")
 	}
 	if len(adapters) == 1 {
 		return adapters[0], nil
@@ -937,11 +937,11 @@ func main() {
 		listInterfaceIPs()
 	}
 
-	ifIndex, _ := getTargetInterface() //getDefaultIfIndex()
-	// if err != nil {
-	// 	fmt.Println("Cannot get default interface:", err)
-	// 	return
-	// }
+	ifIndex, _, err := getTargetInterface() //getDefaultIfIndex()
+	if err != nil {
+		fmt.Println("Cannot get default interface:", err)
+		return
+	}
 
 	fmt.Printf("default interface index: %d\n", ifIndex)
 
@@ -1023,7 +1023,11 @@ func main() {
 		redPrintf("Failed to set gateway: %v\n", err)
 		return
 	}
-	fmt.Println("Default gateway set. Press Ctrl+C to exit and remove it.")
+
+	// 3. THE WAITING ROOM
+	fmt.Println("\n>>> Gateway is ACTIVE. Internet is routed.")
+	fmt.Println(">>> Press Ctrl+C to disconnect and cleanup.")
+	//fmt.Println("Default gateway set. Press Ctrl+C to exit and remove it.")
 
 	// Catch Ctrl+C to remove gateway on exit
 	c := make(chan os.Signal, 1)
