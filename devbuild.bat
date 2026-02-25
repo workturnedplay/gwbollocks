@@ -53,7 +53,7 @@ if errorlevel 1 goto :fail
 ::This flag affects only how Windows initializes the process.
 
 echo Build succeeded.
-pause
+::pause
 goto :eof
 
 :fail

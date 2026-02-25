@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"math/bits"
+	//"math/bits"
 	"os"
 	"os/signal"
 	"strconv"
@@ -509,13 +509,29 @@ func redPrintf(msg string, a ...interface{}) {
 // 	return nil
 // }
 
-func forceSetDefaultGateway(targetGW uint32, ifIndex uint32) error {
+func printForwardRow(label string, row MIB_IPFORWARDROW) {
+	fmt.Printf("\n--- %s ---\n", label)
+	fmt.Printf("Dest:    %08X\n", row.ForwardDest)
+	fmt.Printf("Mask:    %08X\n", row.ForwardMask)
+	fmt.Printf("NextHop: %08X\n", row.ForwardNextHop)
+	fmt.Printf("IfIndex: %d\n", row.ForwardIfIndex)
+	fmt.Printf("Type:    %d (3=Direct, 4=Indirect)\n", row.ForwardType)
+	fmt.Printf("Proto:   %d (3=NetMgmt, 2=Local)\n", row.ForwardProto)
+	fmt.Printf("Policy:  %d (Usually 0)\n", row.ForwardPolicy)
+	fmt.Printf("Metrics: [%d, %d, %d, %d, %d]\n",
+		row.ForwardMetric1, row.ForwardMetric2, row.ForwardMetric3, row.ForwardMetric4, row.ForwardMetric5)
+	fmt.Println("---------------------------")
+}
+
+func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 	var size uint32
 	procGetIpForwardTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
 	buf := make([]byte, size)
 	ret, _, _ := procGetIpForwardTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
 
 	var existingRow *MIB_IPFORWARDROW
+
+	var ifMetric uint32 = 0
 
 	if ret == 0 {
 		num := *(*uint32)(unsafe.Pointer(&buf[0]))
@@ -524,6 +540,12 @@ func forceSetDefaultGateway(targetGW uint32, ifIndex uint32) error {
 
 		for i := uint32(0); i < num; i++ {
 			row := (*MIB_IPFORWARDROW)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + offset))
+
+			// TRACK METRIC: If this row belongs to our interface, save its metric
+			// as a candidate for our new route's metric.
+			if ifMetric == 0 && row.ForwardIfIndex == ifIndex {
+				ifMetric = row.ForwardMetric1
+			}
 
 			// If we find an active default gateway on our target interface...
 			if row.ForwardDest == 0 && row.ForwardMask == 0 && row.ForwardIfIndex == ifIndex {
@@ -539,28 +561,42 @@ func forceSetDefaultGateway(targetGW uint32, ifIndex uint32) error {
 		}
 	}
 
+	// FINAL FALLBACK: If we found no routes at all for this interface, use 25
+	if ifMetric == 0 || ifMetric == ^uint32(0) {
+		ifMetric = 281
+		redPrintf("Couldn't find the metric automatically, using metric %d instead.", ifMetric)
+	}
+
 	var newRow MIB_IPFORWARDROW
 
 	if existingRow != nil {
 		// 2a. Safest approach: Clone the OS parameters and just swap the IP
+		printForwardRow("existingRow before:", *existingRow)
 		newRow = *existingRow
 		newRow.ForwardNextHop = targetGW
 		newRow.ForwardAge = 0
+		printForwardRow("existingRow after:", newRow)
 	} else {
 		// 2b. Fallback if no gateway existed at all
 		newRow = MIB_IPFORWARDROW{
 			ForwardDest:    0,
 			ForwardMask:    0,
+			ForwardPolicy:  0,
 			ForwardNextHop: targetGW,
 			ForwardIfIndex: ifIndex,
-			ForwardType:    4, // MIB_IPROUTE_TYPE_INDIRECT
-			ForwardProto:   3, // MIB_IPPROTO_NETMGMT
-			ForwardMetric1: 1,
+			ForwardType:    4,        // MIB_IPROUTE_TYPE_INDIRECT
+			ForwardProto:   3,        // MIB_IPPROTO_NETMGMT
+			ForwardMetric1: ifMetric, // can't be -1(err 160) or 0(err 87) or 1(err 160)
+			/*
+					Stick with ^uint32(0) for metrics 2 through 5.
+				    Why: In the MIB-II standard used by Windows, -1 (^uint32(0)) explicitly tells the stack "this metric is unused."
+			*/
 			ForwardMetric2: ^uint32(0), // -1
 			ForwardMetric3: ^uint32(0), // -1
 			ForwardMetric4: ^uint32(0), // -1
 			ForwardMetric5: ^uint32(0), // -1
 		}
+		printForwardRow("newRow:", newRow)
 	}
 
 	// 3. Create the route
@@ -603,7 +639,7 @@ func getDefaultIfIndex() (uint32, error) {
 	common, err := ipv4ToUint32LE(commonIP)
 	if err != nil {
 		//FIXME: DRY
-		redPrintf("Failed to convert common IP %s into uint32", commonIP)
+		redPrintf("Failed to convert common IP %s into uint32\n", commonIP)
 		return 0, fmt.Errorf("Failed to convert common IP %s into uint32", commonIP)
 	}
 	ret, _, err := procGetBestInterface.Call(uintptr(common), uintptr(unsafe.Pointer(&ifIndex)))
@@ -656,12 +692,12 @@ func writeDecByte(dst []byte, v byte) int {
 	return 1
 }
 
-// expects big endian
-func ipv4StringBE(ip uint32) string {
-	var buf [15]byte
-	n := formatIPv4(buf[:], ip)
-	return string(buf[:n])
-}
+// // expects big endian
+// func ipv4StringBE(ip uint32) string {
+// 	var buf [15]byte
+// 	n := formatIPv4(buf[:], ip)
+// 	return string(buf[:n])
+// }
 
 // func findPhysicalInterface() (uint32, error) {
 // 	size := uint32(15000)
@@ -761,7 +797,7 @@ func getTargetInterface() (uint32, string) {
 	}
 
 	// 2. Error 1231 happened! The routing table is empty.
-	fmt.Println("No existing gateway found (Error 1231). Please select an interface manually.")
+	fmt.Println("No existing gateway found (Error 1231)")
 	adapter, err := UserSelectInterface()
 	if err != nil {
 		log.Fatalf("Critical Error: %v", err)
@@ -776,7 +812,11 @@ func UserSelectInterface() (NetworkAdapter, error) {
 	if err != nil || len(adapters) == 0 {
 		return NetworkAdapter{}, fmt.Errorf("could not find any active physical adapters")
 	}
+	if len(adapters) == 1 {
+		return adapters[0], nil
+	}
 
+	fmt.Println("Please select an interface manually.")
 	fmt.Println("\n--- Available Network Interfaces ---")
 	for i, a := range adapters {
 		fmt.Printf("[%d] %s\n    IP: %s  (Index: %d)\n", i+1, a.Description, a.IP, a.Index)
@@ -796,7 +836,7 @@ func UserSelectInterface() (NetworkAdapter, error) {
 
 func main() {
 	defer func() {
-		fmt.Printf("Press Enter to exit")
+		fmt.Printf("Press Enter to exit ")
 		var dummy string
 		_, _ = fmt.Scanln(&dummy)
 	}()
@@ -833,13 +873,13 @@ func main() {
 		// redPrintf("Warning: default gateway already exists on this interface: %d.%d.%d.%d\n",
 		// 	ip[0], ip[1], ip[2], ip[3])
 
-		normalized := bits.ReverseBytes32(existingGW)
+		//normalized := bits.ReverseBytes32(existingGW)
 		fmt.Printf("raw:        0x%08X\n", existingGW)
-		fmt.Printf("normalized: 0x%08X\n", normalized)
+		//fmt.Printf("normalized: 0x%08X\n", normalized)
 		//redPrintf("Warning: default gateway already exists on this interface: %s", ipv4String(existingGW))//wrong order
 		//fmt.Println(ipv4String(normalized))
-		redPrintf("Warning: default gateway already exists on this interface: %s", ipv4StringBE(normalized))
-		redPrintf("Warning: default gateway already exists on this interface: %s", ipv4StringLE(existingGW))
+		//redPrintf("Warning: default gateway already exists on this interface: %s", ipv4StringBE(normalized))
+		redPrintf("Warning: default gateway already exists on this interface: %s\n", ipv4StringLE(existingGW))
 	}
 
 	// Example gateway, replace with the “real” GW you want
@@ -848,7 +888,7 @@ func main() {
 	targetGW, err := ipv4ToUint32LE(wantedGW)
 	//fmt.Printf("targetGW as uint32: %08X\n", targetGW)
 	if err != nil {
-		redPrintf("Failed to convert wanted gw IP %s into uint32", wantedGW)
+		redPrintf("Failed to convert wanted gw IP %s into uint32\n", wantedGW)
 		return
 	}
 
@@ -860,7 +900,7 @@ func main() {
 	//defer token.Close() // Add this, bad 'gemini 3 thinking' lol
 	var isAdmin bool = token.IsElevated()
 	if !isAdmin {
-		redPrintf("Must run as admin to effect changes!")
+		redPrintf("Must run as admin to effect changes!\n")
 		return
 	}
 
@@ -870,7 +910,7 @@ func main() {
 	}
 	// Set proper gateway
 	if err := forceSetDefaultGateway(targetGW, ifIndex); err != nil {
-		fmt.Println("Failed to set gateway:", err)
+		redPrintf("Failed to set gateway: %v\n", err)
 		return
 	}
 	fmt.Println("Default gateway set. Press Ctrl+C to exit and remove it.")
@@ -881,8 +921,8 @@ func main() {
 	<-c
 
 	if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
-		fmt.Println("Failed to delete gateway:", err)
+		redPrintf("Failed to delete gateway: %v\n", err)
 	} else {
-		fmt.Println("Default gateway removed, network disabled.")
+		fmt.Println("Default gateway removed, internet access should be off then.")
 	}
 }
