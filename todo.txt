@@ -1,4 +1,5 @@
 todo:
+* on reboot/shutdown/sleep resetting of gw(and setting it back on wake) isn't implemented yet.
 * set the other keys like EnableDHCP=0 and DisableDhcpOnConnect=1 etc. in registry to match this non DHCP thing or maybe it works with DHCP too?
 * make it exit on keypress not on Enter!
 * empty the proper place of DefaultGateway and DefaultGatewayMetric in Computer\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}\
