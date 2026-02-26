@@ -1,4 +1,4 @@
-module gwbollocks
+module github.com/workturnedplay/gwbollocks
 
 go 1.26.0
 
