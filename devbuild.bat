@@ -1,4 +1,14 @@
 @echo off
+setlocal enabledelayedexpansion
+
+:: Use vendor ONLY if we are NOT in a workspace
+set "MOD_FLAG=-mod=vendor"
+if exist "..\go.work" (
+set "MOD_FLAG="
+echo Running unvendored
+) else (
+echo Running vendored
+)
 
 ::if running as admin must get back to current dir:
 cd /d %~dp0
@@ -15,10 +25,13 @@ echo Running go vet...
 :: Including dead branches
 :: Including code not exercised by tests
 ::go vet -mod=vendor ./...
-go vet -mod=vendor -unsafeptr=false
+::go vet -mod=vendor -unsafeptr=false
+go vet !MOD_FLAG! -unsafeptr=false ./...
 if errorlevel 1 goto :fail
 
-go build -mod=vendor .
+::go build -mod=vendor .
+echo Running go build
+go build !MOD_FLAG! .
 if errorlevel 1 goto :fail
 ::pause
 
@@ -53,7 +66,7 @@ if errorlevel 1 goto :fail
 ::This flag affects only how Windows initializes the process.
 
 echo Build succeeded.
-::pause
+pause
 goto :eof
 
 :fail

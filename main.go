@@ -21,8 +21,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	//"log"
-	//"math/bits"
 	"os"
 	"os/signal"
 	"strconv"
@@ -32,6 +30,8 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+
+	"github.com/workturnedplay/wincoe"
 )
 
 var (
@@ -39,14 +39,14 @@ var (
 	procGetBestInterface     = iphlpapiDLL.NewProc("GetBestInterface")
 	procGetIpForwardTable    = iphlpapiDLL.NewProc("GetIpForwardTable")
 	procCreateIpForwardEntry = iphlpapiDLL.NewProc("CreateIpForwardEntry")
-	procSetIpForwardEntry    = iphlpapiDLL.NewProc("SetIpForwardEntry")
+	//procSetIpForwardEntry    = iphlpapiDLL.NewProc("SetIpForwardEntry")
 	procDeleteIpForwardEntry = iphlpapiDLL.NewProc("DeleteIpForwardEntry")
 
 	procGetIfTable     = iphlpapiDLL.NewProc("GetIfTable")
 	procGetIpAddrTable = iphlpapiDLL.NewProc("GetIpAddrTable")
 )
 
-// We define it manually because x/sys/windows does not export the legacy version.
+// MIB_IPFORWARDROW We define it manually because x/sys/windows does not export the legacy version.
 type MIB_IPFORWARDROW struct {
 	ForwardDest      uint32
 	ForwardMask      uint32
@@ -64,7 +64,6 @@ type MIB_IPFORWARDROW struct {
 	ForwardMetric5   uint32
 }
 
-// Corrected legacy MIB_IFROW
 type MIB_IFROW struct {
 	WszName         [256]uint16 // This was missing (512 bytes!)
 	Index           uint32
@@ -114,22 +113,22 @@ func getInterfaceGUID(ifIndex uint32) (string, error) {
 			}
 			return "", fmt.Errorf("GUID not found for index %d", ifIndex)
 		}
-		if err != windows.ERROR_BUFFER_OVERFLOW {
-			return "", err
-		}
+		if !errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
+			return "", fmt.Errorf("GetAdaptersAddresses failed, err: %w", err)
+		} // else continue doing it again with the new size I guess
 	}
 }
 
 func clearPersistentGatewayForIndex(ifIndex uint32) error {
 	guid, err := getInterfaceGUID(ifIndex)
 	if err != nil {
-		return fmt.Errorf("failed to get GUID: %v", err)
+		return fmt.Errorf("failed to get GUID: %w", err)
 	}
 
 	path := fmt.Sprintf(`SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\%s`, guid)
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.SET_VALUE|registry.QUERY_VALUE)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open registry key %s, err: %w", path, err)
 	}
 	defer k.Close()
 
@@ -137,13 +136,16 @@ func clearPersistentGatewayForIndex(ifIndex uint32) error {
 	// If Windows deletes the key entirely, that's actually fine—it means "No GW".
 	err = k.SetStringsValue("DefaultGateway", []string{})
 	if err != nil {
-		return fmt.Errorf("failed to clear DefaultGateway: %v", err)
+		return fmt.Errorf("failed to clear DefaultGateway for GUID interface '%s' with indef '%d', err: %w", guid, ifIndex, err)
 	}
 
 	// Also clear the metric to prevent "ghost" metrics
-	_ = k.SetStringsValue("DefaultGatewayMetric", []string{})
+	err = k.SetStringsValue("DefaultGatewayMetric", []string{})
+	if err != nil {
+		return fmt.Errorf("failed to clear DefaultGatewayMetric for GUID interface '%s' with indef '%d', err: %w", guid, ifIndex, err)
+	}
 
-	fmt.Printf("Successfully scrubbed Registry for Interface %s\n", guid)
+	fmt.Printf("Successfully scrubbed Registry for Interface %s with index %d\n", guid, ifIndex)
 	return nil
 }
 
@@ -278,10 +280,10 @@ func ipv4ToUint32LE(ip string) (uint32, error) {
 // little endian like Windows
 func ipv4StringLE(ip uint32) string {
 	return fmt.Sprintf("%d.%d.%d.%d",
-		byte(ip),
-		byte(ip>>8),
-		byte(ip>>16),
-		byte(ip>>24),
+		byte(ip&0xFF),
+		byte((ip>>8)&0xFF),
+		byte((ip>>16)&0xFF),
+		byte((ip>>24)&0xFF),
 	)
 }
 
@@ -335,7 +337,6 @@ func listInterfaceIPs() error {
 }
 
 func listIfIndexes() error {
-
 	var size uint32
 	// Use 0 to get the required size first
 	ret, _, _ := procGetIfTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
@@ -412,12 +413,16 @@ func listIfIndexes() error {
 // Enumerate routes and check if any default gateway exists on a given interface
 func hasDefaultGateway(ifIndex uint32) (bool, uint32, error) {
 	var size uint32
-	ret, _, _ := procGetIpForwardTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
+	ret, _, callErr := procGetIpForwardTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
+	err := syscall.Errno(ret)
+	if err != syscall.ERROR_INSUFFICIENT_BUFFER {
+		return false, 0, fmt.Errorf("procGetIpForwardTable failed to get size: %d %w, err(wrong):%v", ret, err, callErr)
+	}
 	buf := make([]byte, size)
-	ret, _, err := procGetIpForwardTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
+	ret, _, callErr = procGetIpForwardTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
 	if ret != 0 {
-		return false, 0, fmt.Errorf("GetIpForwardTable failed: %v", err)
-
+		err = syscall.Errno(ret)
+		return false, 0, fmt.Errorf("GetIpForwardTable failed, err(correct): %w, err(wrong):%v", err, callErr)
 	}
 
 	// num := *(*uint32)(unsafe.Pointer(&buf[0]))
@@ -446,28 +451,7 @@ func hasDefaultGateway(ifIndex uint32) (bool, uint32, error) {
 	return false, 0, nil
 }
 
-var (
-	kernel32                    = windows.NewLazySystemDLL("kernel32.dll")
-	procSetConsoleTextAttribute = kernel32.NewProc("SetConsoleTextAttribute")
-	procGetStdHandle            = kernel32.NewProc("GetStdHandle")
-)
-
-const (
-	STD_OUTPUT_HANDLE    = uint32(-11 & 0xFFFFFFFF) // cast to uint32
-	FOREGROUND_RED       = 0x0004
-	FOREGROUND_GREEN     = 0x0002
-	FOREGROUND_BLUE      = 0x0001
-	FOREGROUND_INTENSITY = 0x0008
-
-	// derived colors
-	FOREGROUND_YELLOW        = FOREGROUND_RED | FOREGROUND_GREEN
-	FOREGROUND_BRIGHT_YELLOW = FOREGROUND_YELLOW | FOREGROUND_INTENSITY
-
-	FOREGROUND_MAGENTA        = FOREGROUND_RED | FOREGROUND_BLUE
-	FOREGROUND_BRIGHT_MAGENTA = FOREGROUND_MAGENTA | FOREGROUND_INTENSITY
-)
-
-func colorPrintf(color uintptr, msg string, a ...any) {
+func colorPrintf(color uint16, msg string, a ...any) {
 	//fmt.Printf("\x1b[31m"+msg+"\x1b[0m\n", a...) // XXX: this doesn't work in admin cmd.exe, it's shown raw.
 	hStdout := windows.Stdout
 	// h2, _, callErr := procGetStdHandle.Call(uintptr(STD_OUTPUT_HANDLE))
@@ -483,33 +467,59 @@ func colorPrintf(color uintptr, msg string, a ...any) {
 	// 	panic(fmt.Errorf("unexpected diff. handles for stdout: %d,%d\n", hStdout, handle))
 	// }
 	var csbi windows.ConsoleScreenBufferInfo
-	windows.GetConsoleScreenBufferInfo(hStdout, &csbi)
+	if err := windows.GetConsoleScreenBufferInfo(hStdout, &csbi); err != nil {
+		panic(fmt.Errorf("GetConsoleScreenBufferInfo failed: %w", err))
+	}
 	origAttr := csbi.Attributes
 
-	h2 := uintptr(hStdout)
+	//h2 := uintptr(hStdout)
 	//set red
-	procSetConsoleTextAttribute.Call(h2, color)
+	err := wincoe.SetConsoleTextAttribute(hStdout, color)
+	if err != nil {
+		panic(err)
+	}
+	// //procSetConsoleTextAttribute.Call(h2, color)
+	// ret, _, callErr := procSetConsoleTextAttribute.Call(h2, color)
+	// //In the Windows API (specifically for SetConsoleTextAttribute), the return value ret is a boolean success flag, not an error code.
+	// if ret == 0 { //aka false
+	// 	//The "real" error code is retrieved by Windows via GetLastError().
+	// 	// Go’s syscall.Call automatically calls GetLastError() for you and returns it as the third value: callErr.
+	// 	//Yes, LazyProc.Call (from the internal/syscall/windows or golang.org/x/sys/windows packages) is essentially a wrapper
+	// 	// around the lower-level syscall.Syscall logic. It handles the loading of the DLL and the finding
+	// 	// of the procedure address for you, but the return values follow the exact same Windows API convention.
+	// 	//Is callErr == nil the same as == 0? Usually yes, but the Go error interface can sometimes be "non-nil" while holding a "0" value.
+	// 	if callErr != nil && !errors.Is(callErr, windows.ERROR_SUCCESS) {
+	// 		panic(fmt.Errorf("SetConsoleTextAttribute failed, ret: %d err:%w", ret, callErr))
+	// 	}
+	// 	// If ret was 0 but callErr was ALSO 0 (very rare but possible),
+	// 	// we create a fallback so we don't wrap "Success".
+	// 	panic(fmt.Errorf("SetConsoleTextAttribute returned 0 (failure) but no specific error code"))
+	// }
 	fmt.Printf(msg, a...)
 	//restore
-	procSetConsoleTextAttribute.Call(h2, uintptr(origAttr))
+	//procSetConsoleTextAttribute.Call(h2, uintptr(origAttr))
+	err = wincoe.SetConsoleTextAttribute(hStdout, origAttr)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func greenPrintf(msg string, a ...any) {
-	colorPrintf(FOREGROUND_GREEN|FOREGROUND_INTENSITY, msg, a...)
+	colorPrintf(wincoe.FOREGROUND_GREEN|wincoe.FOREGROUND_INTENSITY, msg, a...)
 }
 
 func redPrintf(msg string, a ...any) {
-	colorPrintf(FOREGROUND_RED|FOREGROUND_INTENSITY, msg, a...)
+	colorPrintf(wincoe.FOREGROUND_RED|wincoe.FOREGROUND_INTENSITY, msg, a...)
 }
 
 func cautionPrintf(msg string, a ...any) {
-	colorPrintf(FOREGROUND_BRIGHT_MAGENTA, msg, a...)
+	colorPrintf(wincoe.FOREGROUND_BRIGHT_MAGENTA, msg, a...)
 }
 
 // indicates the resulting state was already present, eg. deleting a gw, was already deleted by something else
 // but could be an error if this wasn't expected.
 func yellowPrintf(msg string, a ...any) {
-	colorPrintf(FOREGROUND_BRIGHT_YELLOW, msg, a...)
+	colorPrintf(wincoe.FOREGROUND_BRIGHT_YELLOW, msg, a...)
 }
 
 // // Map common IP Helper error codes to human-readable text
@@ -1021,18 +1031,21 @@ func main() {
 	defer func() {
 		fmt.Printf("Press Enter to exit ")
 		var dummy string
-		_, _ = fmt.Scanln(&dummy)
+		_, err := fmt.Scanln(&dummy)
+		_ = err
 	}()
 
 	if err := listIfIndexes(); err != nil {
 		fmt.Println("Error listing interfaces:", err)
 	} else {
-		listInterfaceIPs()
+		if err := listInterfaceIPs(); err != nil {
+			fmt.Println("Error listing interfaces:", err)
+		}
 	}
 
 	ifIndex, _, err := getTargetInterface() //getDefaultIfIndex()
 	if err != nil {
-		fmt.Println("Cannot get default interface:", err)
+		redPrintf("Cannot get default interface: %v\n", err)
 		return
 	}
 

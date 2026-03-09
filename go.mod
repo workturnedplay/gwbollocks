@@ -2,4 +2,7 @@ module github.com/workturnedplay/gwbollocks
 
 go 1.26.0
 
-require golang.org/x/sys v0.41.0
+require (
+	github.com/workturnedplay/wincoe v0.0.0
+	golang.org/x/sys v0.42.0
+)

@@ -9,7 +9,6 @@ set "OLD_GTC=!GOTOOLCHAIN!"
 set "GOTOOLCHAIN=local"
 set "INSTALLED_VER="
 set "PROJECT_VER="
-set "GOWORK=off"
 
 for /f "tokens=3" %%v in ('go version') do (
     set "INSTALLED_VER=%%v"
