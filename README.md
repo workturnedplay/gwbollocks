@@ -26,7 +26,7 @@ Standard Go build (if you want console messages visible):
 go build
 ```
 
-GUI-subsystem build (no console window, recommended):
+GUI-subsystem build (no console window, FIXME: variant isn't yet done(needs systray first)):
 
 ```
 go build -ldflags="-H=windowsgui"
