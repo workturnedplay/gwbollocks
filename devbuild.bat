@@ -27,7 +27,7 @@ if "!HAS_WORKSPACE!"=="1" (
 )
 
 ::if running as admin must get back to current dir:
-cd /d %~dp0
+cd /d "%~dp0"
 
 ::echo Cleaning Go cache
 ::go clean -cache -modcache

@@ -1,7 +1,8 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo TODO: this(no console output variant) isn't implemented yet
+echo TODO: this(no console output variant) isn't implemented yet. Continue or Ctrl+C to exit.
+pause
 
 :: 0. Capture Workspace State
 :: Run this BEFORE you 'set GOWORK=off' if you want to know the original state
@@ -29,7 +30,7 @@ if "!HAS_WORKSPACE!"=="1" (
 )
 
 ::if running as admin must get back to current dir:
-cd /d %~dp0
+cd /d "%~dp0"
 
 echo Running go vet...
 :: ./... means “Walk the directory tree from here, find every Go package, and apply vet to each.”
