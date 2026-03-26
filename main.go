@@ -1009,7 +1009,7 @@ func getWantedGW() (string, error) {
 	// Logic Check
 	switch len(foundIPs) {
 	case 0:
-		return "", fmt.Errorf("Error: No gateway IP found in gateway.cfg")
+		return "", fmt.Errorf("error: No gateway IP found in gateway.cfg")
 	case 1:
 		gatewayIP := foundIPs[0]
 		return gatewayIP, nil
@@ -1029,10 +1029,13 @@ func getWantedGW() (string, error) {
 
 func main() {
 	defer func() {
-		fmt.Printf("Press Enter to exit ")
-		var dummy string
-		_, err := fmt.Scanln(&dummy)
-		_ = err
+		// fmt.Printf("Press Enter to exit ")
+		// var dummy string
+		// _, err := fmt.Scanln(&dummy)
+		// _ = err
+		if !wincoe.WaitAnyKeyIfInteractive() {
+			fmt.Println("Didn't wait for keypress due to not an interactive/terminal.")
+		}
 	}()
 
 	if err := listIfIndexes(); err != nil {
