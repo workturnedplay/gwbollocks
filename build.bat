@@ -1,8 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo TODO: this(no console output variant) isn't implemented yet. Continue or Ctrl+C to exit.
+echo TODO: this(no console output variant) isn't implemented yet.
+::Continue or Ctrl+C to exit.
 pause
+exit 1
 
 :: 0. Capture Workspace State
 :: Run this BEFORE you 'set GOWORK=off' if you want to know the original state
