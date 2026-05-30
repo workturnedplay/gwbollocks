@@ -4,10 +4,11 @@
 Originally located here: https://github.com/workturnedplay/gwbollocks  
 (unless you got it from a fork, try `git remote -v` to check)  
 
-`gwbollocks` is a small Windows utility that I use on win11, it sets the right gateway IP in the LAN connection while it is running
- so that the internet works and thus win11 can have no gw set when booting up or rebooting to phone home.
+`gwbollocks` is a small Windows utility that I used to use on win11(before I switched to Linux), it sets the right gateway IP in the LAN connection while it is running
+ so that the internet works and thus win11 can have no gw set when booting up or rebooting to phone home.  
 It removes the gw on exit or Ctrl+C (TODO: and when win11 wants to reboot/shutdown).  
-It was built with AI assistance.  
+Ctrl+R to toggle having the gw or removing it, while running.  
+It was built with AI assistance(via chat, not agentic).  
 
 ---
 
