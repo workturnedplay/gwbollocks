@@ -22,7 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
+	//"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
@@ -734,7 +734,42 @@ func getWantedGW() (string, error) {
 	}
 }
 
+func onlinkgatewayremoval(targetGW, ifIndex uint32, complainIfFails bool) {
+	if removeDirectGWRoute {
+		if err := deleteDirectRoute(targetGW, ifIndex); err != nil {
+			if errors.Is(err, windows.Errno(1168)) {
+				yellowPrintf("Apparently the on-link gateway entry was already removed, possibly by another instance u ran in parallel and exited! err: %v\n", err)
+			} else {
+				redPrintf("Failed to delete the on-link gateway: %v\n", err)
+			}
+		} else {
+			greenPrintf("on-link direct route to gateway removed\n")
+		}
+		removeDirectGWRoute = false // Reset for next toggle
+	} else if complainIfFails {
+		redPrintf("Not removing on-link gateway (wasn't set? run: route print -4)\n")
+	}
+}
+
+func defaultgatewayremoval(targetGW, ifIndex uint32, complainIfFails bool) {
+	if removeActiveGateway {
+		if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
+			if errors.Is(err, windows.Errno(1168)) {
+				yellowPrintf("Apparently the gateway was already removed, possibly by another instance u ran in parallel and exited! err: %v\n", err)
+			} else {
+				redPrintf("Failed to delete gateway: %v\n", err)
+			}
+		} else {
+			greenPrintf("Default gateway removed, internet access should be off then.\n")
+		}
+		removeActiveGateway = false // Reset for next toggle
+	} else if complainIfFails {
+		redPrintf("Not removing gateway (wasn't set? run: route print -4)\n")
+	}
+}
+
 func main() {
+	// Top-level defer: Executes last! Restored console state guarantees exclusive, clean access here.
 	defer func() {
 		if !wincoe.WaitAnyKeyIfInteractive() {
 			fmt.Println("Didn't wait for keypress due to not an interactive/terminal.")
@@ -783,37 +818,9 @@ func main() {
 		return
 	}
 
-	defer func() {
-		if removeDirectGWRoute {
-			if err := deleteDirectRoute(targetGW, ifIndex); err != nil {
-				if errors.Is(err, windows.Errno(1168)) {
-					yellowPrintf("Apparently the on-link gateway entry was already removed, possibly by another instance u ran in parallel and exited! err: %v\n", err)
-				} else {
-					redPrintf("Failed to delete the on-link gateway: %v\n", err)
-				}
-			} else {
-				greenPrintf("on-link direct route to gateway removed\n")
-			}
-		} else {
-			redPrintf("Not removing on-link gateway (wasn't set? run: route print -4)")
-		}
-	}()
-
-	defer func() {
-		if removeActiveGateway {
-			if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
-				if errors.Is(err, windows.Errno(1168)) {
-					yellowPrintf("Apparently the gateway was already removed, possibly by another instance u ran in parallel and exited! err: %v\n", err)
-				} else {
-					redPrintf("Failed to delete gateway: %v\n", err)
-				}
-			} else {
-				greenPrintf("Default gateway removed, internet access should be off then.\n")
-			}
-		} else {
-			redPrintf("Not removing gateway (wasn't set? run: route print -4)")
-		}
-	}()
+	//too early, if not admin they won't be able to remove:
+	// defer onlinkgatewayremoval(targetGW, ifIndex)
+	// defer defaultgatewayremoval(targetGW, ifIndex)
 
 	//ip := *(*[4]byte)(unsafe.Pointer(&targetGW))
 	fmt.Printf("The gateway that we want is %s aka 0x%08X\n",
@@ -827,24 +834,113 @@ func main() {
 		return
 	}
 
-	if err := clearPersistentGatewayForIndex(ifIndex); err != nil {
-		fmt.Println("Failed to delete persistent gateway(ie. the one set in LAN adapter settings, seen by 'route print' under 'Persistent Routes'), err:", err)
-		return //FIXME: exit codes!
-	}
-	// Set proper gateway
-	if err := forceSetDefaultGateway(targetGW, ifIndex); err != nil {
-		redPrintf("Failed to set gateway: %v\n", err)
-		return
+	// if err := clearPersistentGatewayForIndex(ifIndex); err != nil {
+	// 	fmt.Println("Failed to delete persistent gateway(ie. the one set in LAN adapter settings, seen by 'route print' under 'Persistent Routes'), err:", err)
+	// 	return //FIXME: exit codes!
+	// }
+	// // Set proper gateway
+	// if err := forceSetDefaultGateway(targetGW, ifIndex); err != nil {
+	// 	redPrintf("Failed to set gateway: %v\n", err)
+	// 	return
+	// }
+
+	// // 3. THE WAITING ROOM
+	// cautionPrintf("\n>>> Gateway is ACTIVE. Internet is routed.\n")
+	// cautionPrintf(">>> Press Ctrl+C to disconnect and cleanup.\n")
+
+	// // Catch Ctrl+C to remove gateway on exit
+	// c := make(chan os.Signal, 1)
+	// signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	// <-c
+	// fmt.Println("\n[!] Shutdown signal received. Cleaning up routes...")
+	// // The defers will now trigger as main() finishes after this point.
+
+	// 1. Put Stdin into raw mode so we can capture Ctrl+R instantly (without hitting Enter)
+	// We keep ENABLE_PROCESSED_INPUT active so Ctrl+C still sends SIGINT to our channel.
+	var oldMode uint32
+	if err := windows.GetConsoleMode(windows.Stdin, &oldMode); err == nil {
+		//newMode := oldMode &^ (windows.ENABLE_LINE_INPUT | windows.ENABLE_ECHO_INPUT)
+		newMode := oldMode &^ (windows.ENABLE_LINE_INPUT | windows.ENABLE_ECHO_INPUT | windows.ENABLE_PROCESSED_INPUT)
+		windows.SetConsoleMode(windows.Stdin, newMode)
+		//defer windows.SetConsoleMode(windows.Stdin, oldMode) // Restore mode on exit
+		defer windows.SetConsoleMode(windows.Stdin, oldMode) // Executes 2nd on exit, restoring cooked console
 	}
 
-	// 3. THE WAITING ROOM
-	cautionPrintf("\n>>> Gateway is ACTIVE. Internet is routed.\n")
-	cautionPrintf(">>> Press Ctrl+C to disconnect and cleanup.\n")
+	var isActive bool
 
-	// Catch Ctrl+C to remove gateway on exit
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
-	fmt.Println("\n[!] Shutdown signal received. Cleaning up routes...")
-	// The defers will now trigger as main() finishes after this point.
+	// 2. Wrap routing logic into an activate closure
+	activate := func() {
+		if err := clearPersistentGatewayForIndex(ifIndex); err != nil {
+			//fmt.Println("Failed to delete persistent gateway...", err)
+			fmt.Println("Failed to delete persistent gateway(ie. the one set in LAN adapter settings, seen by 'route print' under 'Persistent Routes'), err:", err)
+			return //XXX: yes, we don't wanna continue if this fails
+		}
+		if err := forceSetDefaultGateway(targetGW, ifIndex); err != nil {
+			redPrintf("Failed to set gateway: %v\n", err)
+			return
+		}
+		isActive = true
+		cautionPrintf("\n>>> Gateway is ACTIVE. Internet is routed.\n")
+	}
+
+	// 3. Wrap cleanup logic into a deactivate closure
+	deactivate := func() {
+		onlinkgatewayremoval(targetGW, ifIndex, isActive)
+		defaultgatewayremoval(targetGW, ifIndex, isActive)
+
+		isActive = false
+		yellowPrintf("\n>>> Gateway is INACTIVE. Internet is blocked.\n")
+	}
+
+	// Executes 1st on exit: Triggers cleanup if the loop breaks while active.
+	// Guarantee cleanup on exit (handles Ctrl+C or normal return)
+	defer func() {
+		//if isActive {
+		deactivate()
+		//}
+	}()
+
+	// Initial Activation
+	activate()
+
+	// 4. THE WAITING ROOM
+	cautionPrintf(">>> Press Ctrl+R to toggle state. Press Ctrl+C to disconnect and exit.\n")
+
+	// // Catch Ctrl+C to remove gateway on exit
+	// c := make(chan os.Signal, 1)
+	// signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	// Sequential loop on the main goroutine
+	buf := make([]byte, 1)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			break
+		}
+		if buf[0] == 3 { // 0x03 = Ctrl+C
+			fmt.Println("\n[!] Ctrl+C detected. Cleaning up routes and restoring terminal...")
+			break // Breaking triggers sequential defers naturally
+		}
+		if buf[0] == 18 { // 0x12 = Ctrl+R
+			if isActive {
+				deactivate()
+			} else {
+				activate()
+			}
+		}
+	}
+
+	// for {
+	// 	select {
+	// 	case <-c:
+	// 		fmt.Println("\n[!] Shutdown signal received. Cleaning up routes...")
+	// 		return // Exiting main() triggers the `defer` cleanup naturally
+	// 	case <-toggleCh:
+	// 		if isActive {
+	// 			deactivate()
+	// 		} else {
+	// 			activate()
+	// 		}
+	// 	}
+	// }
 }
