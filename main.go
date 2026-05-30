@@ -768,6 +768,38 @@ func defaultgatewayremoval(targetGW, ifIndex uint32, complainIfFails bool) {
 	}
 }
 
+var (
+	kernel32                  = windows.NewLazySystemDLL("kernel32.dll")
+	procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
+
+	globalCleanup func() // Anchor to bridge inside main() to the callback safely
+)
+
+// The callback function that Windows calls during shutdown/logoff events.
+// Since this utility operates entirely out of the Windows Command Prompt or PowerShell, utilizing SetConsoleCtrlHandler is significantly cleaner.
+// It registers a control handler function that directly catches CTRL_SHUTDOWN_EVENT and CTRL_LOGOFF_EVENT sent by Win11 during a restart.
+func consoleCtrlHandler(ctrlType uint32) uintptr {
+	const (
+		CTRL_C_EVENT     = 0
+		CTRL_BREAK_EVENT = 1
+		//clicked the close button on top right:
+		CTRL_CLOSE_EVENT = 2
+		//if win11 wants to restart/shutdown:
+		CTRL_LOGOFF_EVENT   = 5
+		CTRL_SHUTDOWN_EVENT = 6
+	)
+	switch ctrlType {
+	//case windows.CTRL_LOGOFF_EVENT, windows.CTRL_SHUTDOWN_EVENT:
+	case CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT:
+		// We handle ALL terminating events here to ensure the gateway is stripped
+		if globalCleanup != nil {
+			globalCleanup()
+		}
+		return 1 // Signal that the event has been handled // Return TRUE to let Windows know we've processed the event
+	}
+	return 0 // Pass unhandled events back to OS defaults // Pass other events back to Windows defaults
+}
+
 func main() {
 	// Top-level defer: Executes last! Restored console state guarantees exclusive, clean access here.
 	defer func() {
@@ -899,6 +931,23 @@ func main() {
 		deactivate()
 		//}
 	}()
+
+	// Bind the local closure to the global function holder
+	// Bind our local cleanup logic to the package-level anchor
+	globalCleanup = deactivate
+
+	// Register the callback with Windows via kernel32.dll
+	// Passing '1' as the second argument sets/adds the handler.
+	ret, _, err := procSetConsoleCtrlHandler.Call(windows.NewCallback(consoleCtrlHandler), 1)
+	//_ = windows.SetConsoleCtrlHandler(windows.NewCallback(consoleCtrlHandler), true)
+	if ret == 0 {
+		// If ret is 0, the API failed. windows.Errno converts the last-error code into readable text.
+		redPrintf("CRITICAL: Failed to register console control handler: %v (errno: %d)\n", err, windows.Errno(ret))
+		return
+	} else {
+		// Just a quiet sanity check confirmation during startup
+		fmt.Println("OS termination handler successfully registered.")
+	}
 
 	// Initial Activation
 	activate()
