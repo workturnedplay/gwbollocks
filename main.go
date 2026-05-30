@@ -37,13 +37,13 @@ import (
 var (
 	iphlpapiDLL              = windows.NewLazySystemDLL("iphlpapi.dll")
 	procGetBestInterface     = iphlpapiDLL.NewProc("GetBestInterface")
-	procGetIpForwardTable    = iphlpapiDLL.NewProc("GetIpForwardTable")
-	procCreateIpForwardEntry = iphlpapiDLL.NewProc("CreateIpForwardEntry")
+	procGetIPForwardTable    = iphlpapiDLL.NewProc("GetIpForwardTable")
+	procCreateIPForwardEntry = iphlpapiDLL.NewProc("CreateIpForwardEntry")
 	//procSetIpForwardEntry    = iphlpapiDLL.NewProc("SetIpForwardEntry")
-	procDeleteIpForwardEntry = iphlpapiDLL.NewProc("DeleteIpForwardEntry")
+	procDeleteIPForwardEntry = iphlpapiDLL.NewProc("DeleteIpForwardEntry")
 
 	procGetIfTable     = iphlpapiDLL.NewProc("GetIfTable")
-	procGetIpAddrTable = iphlpapiDLL.NewProc("GetIpAddrTable")
+	procGetIPAddrTable = iphlpapiDLL.NewProc("GetIpAddrTable")
 )
 
 // MIB_IPFORWARDROW We define it manually because x/sys/windows does not export the legacy version.
@@ -149,124 +149,6 @@ func clearPersistentGatewayForIndex(ifIndex uint32) error {
 	return nil
 }
 
-// // Convert IPv4 string to uint32 in network byte order
-// func ipv4ToUint32(ip string) uint32 {
-// 	var b [4]byte
-// 	fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
-// 	return binary.LittleEndian.Uint32(b[:])
-// }
-
-// Convert IPv4 string to uint32 in network byte order
-// fixed by Gemini 3 Thinking
-//
-//	func ipv4ToUint32(ip string) uint32 {
-//		var b [4]byte
-//		fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
-//		// CRITICAL: Networking is Big Endian
-//		return binary.BigEndian.Uint32(b[:]) // Change to BigEndian
-//	}
-
-// // Convert IPv4 string to uint32 in a way that produces Network Byte Order in memory
-//
-//	func ipv4ToUint32(ip string) uint32 {
-//		var b [4]byte
-//		fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
-//		// Use LittleEndian so that b[0] (192) ends up at the lowest memory address
-//		return binary.LittleEndian.Uint32(b[:])
-//	}
-//
-//	func ipv4ToUint32(ip string) uint32 {
-//		var b [4]byte
-//		fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
-//		return uint32(b[0])<<24 |
-//			uint32(b[1])<<16 |
-//			uint32(b[2])<<8 |
-//			uint32(b[3])
-//		//192.168.1.1 → 0xC0A80101
-//		//which matches the API’s documented expectation.
-//	}
-//
-
-// // parseIPv4ToUint32 converts dotted IPv4 to a uint32 in network order(aka big endian).
-// // No allocations. Strict validation. Hot-path safe.
-// func parseIPv4ToUint32(ipv4 string) (uint32, error) {
-// 	if len(ipv4) < 7 || len(ipv4) > 15 { // 0.0.0.0 .. 255.255.255.255
-// 		return 0, fmt.Errorf("invalid IPv4 length")
-// 	}
-
-// 	var parts [4]uint32
-// 	part := 0
-// 	var val uint32
-// 	digits := 0
-
-// 	for i := 0; i < len(ipv4); i++ {
-// 		c := ipv4[i]
-
-// 		switch {
-// 		case c >= '0' && c <= '9':
-// 			val = val*10 + uint32(c-'0')
-// 			if val > 255 {
-// 				return 0, fmt.Errorf("octet out of range")
-// 			}
-// 			digits++
-// 			if digits > 3 {
-// 				return 0, fmt.Errorf("octet too long")
-// 			}
-
-// 		case c == '.':
-// 			if digits == 0 {
-// 				return 0, fmt.Errorf("empty octet")
-// 			}
-// 			if part >= 3 {
-// 				return 0, fmt.Errorf("too many octets")
-// 			}
-// 			parts[part] = val
-// 			part++
-// 			val = 0
-// 			digits = 0
-
-// 		default:
-// 			return 0, fmt.Errorf("invalid character in IPv4")
-// 		}
-// 	}
-
-// 	// finalize last octet
-// 	if part != 3 || digits == 0 {
-// 		return 0, fmt.Errorf("invalid IPv4 format")
-// 	}
-// 	parts[3] = val
-
-// 	// network-order numeric value (contract-correct)
-// 	return (parts[0] << 24) |
-// 		(parts[1] << 16) |
-// 		(parts[2] << 8) |
-// 		(parts[3]), nil
-// }
-
-// // big endian
-// func ipv42String(ip uint32) string {
-// 	return fmt.Sprintf("%d.%d.%d.%d",
-// 		byte(ip),
-// 		byte(ip>>8),
-// 		byte(ip>>16),
-// 		byte(ip>>24),
-// 	)
-// }
-
-// // big endian
-// func ipv4StringToUint32(ip string) (uint32, error) {
-// 	var b [4]byte
-// 	n, err := fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
-// 	if err != nil || n != 4 {
-// 		return 0, fmt.Errorf("invalid IPv4: %q", ip)
-// 	}
-// 	return uint32(b[0]) |
-// 			uint32(b[1])<<8 |
-// 			uint32(b[2])<<16 |
-// 			uint32(b[3])<<24,
-// 		nil
-// }
-
 // little endian like Windows
 func ipv4ToUint32LE(ip string) (uint32, error) {
 	var b [4]byte
@@ -304,10 +186,10 @@ type MIB_IPADDRTABLE struct {
 
 func listInterfaceIPs() error {
 	var size uint32
-	procGetIpAddrTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
+	procGetIPAddrTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
 
 	buf := make([]byte, size)
-	ret, _, _ := procGetIpAddrTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
+	ret, _, _ := procGetIPAddrTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
 	if ret != 0 {
 		return fmt.Errorf("GetIpAddrTable failed: %v", ret)
 	}
@@ -359,37 +241,9 @@ func listIfIndexes() error {
 	// Offset is exactly 4 bytes (the size of 'num')
 	offset := uintptr(4)
 	rowSize := unsafe.Sizeof(MIB_IFROW{})
-	//rowPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + unsafe.Sizeof(num))
 
-	//fmt.Printf("Interfaces:\n")
 	fmt.Printf("Interfaces found: %d\n", num)
-	// for i := uint32(0); i < num; i++ {
-	// 	// row := *(*MIB_IFROW)(rowPtr)
-	// 	// fmt.Printf("Index: %d, Type: %d, AdminStatus: %d, OperStatus: %d, MTU: %d\n",
-	// 	// 	row.Index, row.Type, row.AdminStatus, row.OperStatus, row.Mtu)
-	// 	// rowPtr = unsafe.Pointer(uintptr(rowPtr) + unsafe.Sizeof(row))
-	// 	row := (*MIB_IFROW)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + offset))
-	// 	fmt.Printf("[%d] Index: %d, MTU: %d, Type: %d, Status: %d\n",
-	// 		i, row.Index, row.Mtu, row.Type, row.OperStatus)
-	// 	offset += rowSize
-	// }
-	// for i := uint32(0); i < num; i++ {
-	// 	// Use the package-level MIB_IFROW definition
-	// 	row := (*MIB_IFROW)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + offset))
 
-	// 	// Cleanly extract the description (it's a null-terminated byte array)
-	// 	descr := ""
-	// 	for j := 0; j < int(row.DescrLen) && j < len(row.Descr); j++ {
-	// 		if row.Descr[j] == 0 {
-	// 			break
-	// 		}
-	// 		descr += string(row.Descr[j])
-	// 	}
-
-	// 	fmt.Printf("[%d] Index: %d, Type: %d, MTU: %d, Name: %s\n",
-	// 		i, row.Index, row.Type, row.Mtu, descr)
-	// 	offset += rowSize
-	// }
 	for i := uint32(0); i < num; i++ {
 		row := (*MIB_IFROW)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + offset))
 
@@ -413,28 +267,18 @@ func listIfIndexes() error {
 // Enumerate routes and check if any default gateway exists on a given interface
 func hasDefaultGateway(ifIndex uint32) (bool, uint32, error) {
 	var size uint32
-	ret, _, callErr := procGetIpForwardTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
+	ret, _, callErr := procGetIPForwardTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
 	err := syscall.Errno(ret)
 	if err != syscall.ERROR_INSUFFICIENT_BUFFER {
 		return false, 0, fmt.Errorf("procGetIpForwardTable failed to get size: %d %w, err(wrong):%v", ret, err, callErr)
 	}
 	buf := make([]byte, size)
-	ret, _, callErr = procGetIpForwardTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
+	ret, _, callErr = procGetIPForwardTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
 	if ret != 0 {
 		err = syscall.Errno(ret)
 		return false, 0, fmt.Errorf("GetIpForwardTable failed, err(correct): %w, err(wrong):%v", err, callErr)
 	}
 
-	// num := *(*uint32)(unsafe.Pointer(&buf[0]))
-	// rowPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + unsafe.Sizeof(num))
-
-	// for i := uint32(0); i < num; i++ {
-	// 	row := *(*MIB_IPFORWARDROW)(rowPtr)
-	// 	if row.ForwardDest == 0 && row.ForwardMask == 0 && row.ForwardIfIndex == ifIndex {
-	// 		return true, row.ForwardNextHop, nil
-	// 	}
-	// 	rowPtr = unsafe.Pointer(uintptr(rowPtr) + unsafe.Sizeof(row))
-	// }
 	num := *(*uint32)(unsafe.Pointer(&buf[0]))
 	// MIB_IPFORWARDTABLE also has the 4-byte padding on x64
 	//offset := uintptr(8)//bad 'gemini 3 thinking'
@@ -454,18 +298,6 @@ func hasDefaultGateway(ifIndex uint32) (bool, uint32, error) {
 func colorPrintf(color uint16, msg string, a ...any) {
 	//fmt.Printf("\x1b[31m"+msg+"\x1b[0m\n", a...) // XXX: this doesn't work in admin cmd.exe, it's shown raw.
 	hStdout := windows.Stdout
-	// h2, _, callErr := procGetStdHandle.Call(uintptr(STD_OUTPUT_HANDLE))
-	// handle := windows.Handle(h2)
-	// if handle == 0 || handle == windows.InvalidHandle {
-	// 	// callErr is only meaningful on failure
-	// 	if callErr != nil && callErr != windows.ERROR_SUCCESS {
-	// 		panic(fmt.Errorf("GetStdHandle failed: %w", callErr))
-	// 	}
-	// 	panic(fmt.Errorf("GetStdHandle returned invalid handle"))
-	// }
-	// if hStdout != handle {
-	// 	panic(fmt.Errorf("unexpected diff. handles for stdout: %d,%d\n", hStdout, handle))
-	// }
 	var csbi windows.ConsoleScreenBufferInfo
 	if err := windows.GetConsoleScreenBufferInfo(hStdout, &csbi); err != nil {
 		panic(fmt.Errorf("GetConsoleScreenBufferInfo failed: %w", err))
@@ -478,26 +310,8 @@ func colorPrintf(color uint16, msg string, a ...any) {
 	if err != nil {
 		panic(err)
 	}
-	// //procSetConsoleTextAttribute.Call(h2, color)
-	// ret, _, callErr := procSetConsoleTextAttribute.Call(h2, color)
-	// //In the Windows API (specifically for SetConsoleTextAttribute), the return value ret is a boolean success flag, not an error code.
-	// if ret == 0 { //aka false
-	// 	//The "real" error code is retrieved by Windows via GetLastError().
-	// 	// Go’s syscall.Call automatically calls GetLastError() for you and returns it as the third value: callErr.
-	// 	//Yes, LazyProc.Call (from the internal/syscall/windows or golang.org/x/sys/windows packages) is essentially a wrapper
-	// 	// around the lower-level syscall.Syscall logic. It handles the loading of the DLL and the finding
-	// 	// of the procedure address for you, but the return values follow the exact same Windows API convention.
-	// 	//Is callErr == nil the same as == 0? Usually yes, but the Go error interface can sometimes be "non-nil" while holding a "0" value.
-	// 	if callErr != nil && !errors.Is(callErr, windows.ERROR_SUCCESS) {
-	// 		panic(fmt.Errorf("SetConsoleTextAttribute failed, ret: %d err:%w", ret, callErr))
-	// 	}
-	// 	// If ret was 0 but callErr was ALSO 0 (very rare but possible),
-	// 	// we create a fallback so we don't wrap "Success".
-	// 	panic(fmt.Errorf("SetConsoleTextAttribute returned 0 (failure) but no specific error code"))
-	// }
 	fmt.Printf(msg, a...)
 	//restore
-	//procSetConsoleTextAttribute.Call(h2, uintptr(origAttr))
 	err = wincoe.SetConsoleTextAttribute(hStdout, origAttr)
 	if err != nil {
 		panic(err)
@@ -522,53 +336,6 @@ func yellowPrintf(msg string, a ...any) {
 	colorPrintf(wincoe.FOREGROUND_BRIGHT_YELLOW, msg, a...)
 }
 
-// // Map common IP Helper error codes to human-readable text
-// func ipHelperErrText(code uintptr /*uint32*/) string {
-// 	switch code {
-// 	case 0:
-// 		return "SUCCESS"
-// 	case 87: // ERROR_INVALID_PARAMETER
-// 		return "One or more arguments are not correct"
-// 	case 160: // ERROR_NOACCESS
-// 		return "Attempt to access the address in memory that is not valid(dev/coding error)"
-// 	default:
-// 		return fmt.Sprintf("Unknown IP Helper error code: %d, but errno says: '%v'", code, windows.Errno(code))
-// 	}
-// }
-
-// func forceSetDefaultGateway(gw uint32, ifIndex uint32) error {
-// 	//according to Microsoft's IP Helper API documentation, unused routing metrics MUST be set to -1 (which is 0xFFFFFFFF or ^uint32(0)).
-// 	// When you pass 0 to these metrics, CreateIpForwardEntry rejects the entire struct because 0 is an invalid metric value,
-// 	// hence "One or more arguments are not correct" (Error 160).
-// 	// 1. Prepare the row
-// 	row := MIB_IPFORWARDROW{
-// 		ForwardDest:    0,
-// 		ForwardMask:    0,
-// 		ForwardNextHop: gw,
-// 		ForwardIfIndex: ifIndex,
-// 		ForwardType:    4, // MIB_IPROUTE_TYPE_INDIRECT
-// 		ForwardProto:   3, // MIB_IPPROTO_NETMGMT
-// 		ForwardMetric1: 1,
-// 		ForwardMetric2: ^uint32(0), // CRITICAL: Unused metrics must be -1
-// 		ForwardMetric3: ^uint32(0),
-// 		ForwardMetric4: ^uint32(0),
-// 		ForwardMetric5: ^uint32(0),
-// 	}
-
-// 	// 2. Always attempt to delete first to clear the path
-// 	// We ignore the return because if it doesn't exist, that's fine.
-// 	_, _, _ = procDeleteIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
-// 	_ = deleteDefaultGateway(gw, ifIndex)
-
-// 	// 3. Create the new entry
-// 	ret, _, _ := procCreateIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
-// 	if ret != 0 {
-// 		//return fmt.Errorf("CreateIpForwardEntry failed: %d %w", ret, windows.Errno(ret))
-// 		return fmt.Errorf("CreateIpForwardEntry failed: %w (code %d)", windows.Errno(ret), ret)
-// 	}
-// 	return nil
-// }
-
 func printForwardRow(label string, row MIB_IPFORWARDROW) {
 	fmt.Printf("\n--- %s ---\n", label)
 	fmt.Printf("Dest:    %08X\n", row.ForwardDest)
@@ -585,9 +352,9 @@ func printForwardRow(label string, row MIB_IPFORWARDROW) {
 
 func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 	var size uint32
-	procGetIpForwardTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
+	procGetIPForwardTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
 	buf := make([]byte, size)
-	ret, _, _ := procGetIpForwardTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
+	ret, _, _ := procGetIPForwardTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
 
 	var existingRow *MIB_IPFORWARDROW
 
@@ -615,7 +382,7 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 					existingRow = &copiedRow
 				}
 				// 1. CLEAR THE PATH: Delete the exact route using the OS's own memory struct
-				procDeleteIpForwardEntry.Call(uintptr(unsafe.Pointer(row)))
+				procDeleteIPForwardEntry.Call(uintptr(unsafe.Pointer(row)))
 			}
 			offset += rowSize
 		}
@@ -683,7 +450,7 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 	// if it hits the race then at worst the deletion fails, but it won't exit, it will get to next defer in worst case
 	//Same thing for the other bool below.
 	removeDirectGWRoute = true // rather fail to delete it than miss deleting it due to race.
-	ret, _, _ = procCreateIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
+	ret, _, _ = procCreateIPForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
 	if ret != 0 {
 		errNoRet := windows.Errno(ret)
 		//continue because it works w/o this anyway!
@@ -703,7 +470,7 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 	// }
 	// 3. Create the route
 	removeActiveGateway = true // rather fail to delete it than miss deleting it due to race.
-	ret, _, _ = procCreateIpForwardEntry.Call(uintptr(unsafe.Pointer(&newRow)))
+	ret, _, _ = procCreateIPForwardEntry.Call(uintptr(unsafe.Pointer(&newRow)))
 	if ret != 0 {
 		if ret == 5010 {
 			// The object already exists. (code 5010)
@@ -741,7 +508,7 @@ func deleteDefaultGateway(gw uint32, ifIndex uint32) error {
 		ForwardMetric4: ^uint32(0),
 		ForwardMetric5: ^uint32(0),
 	}
-	ret, _, err := procDeleteIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
+	ret, _, err := procDeleteIPForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
 	if ret != 0 {
 		return fmt.Errorf("DeleteIpForwardEntry failed, ret=%d, err(wrong):'%v', errno(correct):'%w'",
 			ret, err, windows.Errno(ret))
@@ -764,7 +531,7 @@ func deleteDirectRoute(targetGW uint32, ifIndex uint32) error {
 		ForwardMetric5: ^uint32(0),
 	}
 
-	ret, _, _ := procDeleteIpForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
+	ret, _, _ := procDeleteIPForwardEntry.Call(uintptr(unsafe.Pointer(&row)))
 
 	// 1168 is ERROR_NOT_FOUND. If it's already gone, we don't care.
 	if ret != 0 { //&& ret != 1168 {
@@ -783,7 +550,7 @@ func getDefaultIfIndex() (uint32, error) {
 	if err != nil {
 		//FIXME: DRY
 		redPrintf("Failed to convert common IP %s into uint32\n", commonIP)
-		return 0, fmt.Errorf("Failed to convert common IP %s into uint32", commonIP)
+		return 0, fmt.Errorf("failed to convert common IP %s into uint32", commonIP)
 	}
 	ret, _, err := procGetBestInterface.Call(uintptr(common), uintptr(unsafe.Pointer(&ifIndex)))
 	if ret != 0 {
@@ -834,58 +601,6 @@ func writeDecByte(dst []byte, v byte) int {
 	dst[0] = '0' + v
 	return 1
 }
-
-// // expects big endian
-// func ipv4StringBE(ip uint32) string {
-// 	var buf [15]byte
-// 	n := formatIPv4(buf[:], ip)
-// 	return string(buf[:n])
-// }
-
-// func findPhysicalInterface() (uint32, error) {
-// 	size := uint32(15000)
-// 	for {
-// 		b := make([]byte, size)
-// 		err := windows.GetAdaptersAddresses(windows.AF_INET, windows.GAA_FLAG_SKIP_ANYCAST, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &size)
-// 		if err == nil {
-// 			addr := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0]))
-// 			for addr != nil {
-// 				// Filter for: Physical (Ethernet/WiFi) + OperStatus Up
-// 				// 6 = Ethernet, 71 = WiFi
-// 				if (addr.IfType == 6 || addr.IfType == 71) && addr.OperStatus == windows.IfOperStatusUp {
-// 					// Ensure it has at least one Unicast address (an IP)
-// 					if addr.FirstUnicastAddress != nil {
-// 						fmt.Printf("Found candidate interface: %s (Index: %d)\n", windows.BytePtrToString(addr.Description), addr.IfIndex)
-// 						return addr.IfIndex, nil
-// 					}
-// 				}
-// 				addr = addr.Next
-// 			}
-// 			return 0, fmt.Errorf("no active physical interface found")
-// 		}
-// 		if err != windows.ERROR_BUFFER_OVERFLOW {
-// 			return 0, err
-// 		}
-// 	}
-// }
-
-// func getIndexFromGUID(savedGUID string) (uint32, error) {
-// 	size := uint32(15000)
-// 	b := make([]byte, size)
-// 	err := windows.GetAdaptersAddresses(windows.AF_INET, 0, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &size)
-// 	if err != nil {
-// 		return 0, err
-// 	}
-
-// 	addr := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0]))
-// 	for addr != nil {
-// 		if windows.BytePtrToString(addr.AdapterName) == savedGUID {
-// 			return addr.IfIndex, nil
-// 		}
-// 		addr = addr.Next
-// 	}
-// 	return 0, fmt.Errorf("interface not found")
-// }
 
 type NetworkAdapter struct {
 	Index       uint32
@@ -982,7 +697,7 @@ const gwFile = "gateway.cfg"
 func getWantedGW() (string, error) {
 	file, err := os.Open(gwFile)
 	if err != nil {
-		return "", fmt.Errorf("Error opening file '%s', err:'%w' Create the file and store an IP like 192.168.1.1 on a line. # are comments (inline too)\n", gwFile, err)
+		return "", fmt.Errorf("failed opening file '%s', err:'%w' Create the file and store an IP like 192.168.1.1 on a line. # are comments (inline too)", gwFile, err)
 	}
 	defer file.Close()
 
@@ -1014,25 +729,13 @@ func getWantedGW() (string, error) {
 		gatewayIP := foundIPs[0]
 		return gatewayIP, nil
 	default:
-		// // 4. Handle multiple IPs found
-		// fmt.Printf("Error: Multiple IP entries found in gateway.cfg:\n")
-		// for _, ip := range foundIPs {
-		// 	fmt.Printf("  - %s\n", ip)
-		// }
-		// fmt.Println("Please ensure only one IP is active (comment out the rest).")
-		//if len(foundIPs) > 1 {
 		return "", fmt.Errorf("multiple IP entries found: [%s]. Please ensure only one is active",
 			strings.Join(foundIPs, ", "))
-		//}
 	}
 }
 
 func main() {
 	defer func() {
-		// fmt.Printf("Press Enter to exit ")
-		// var dummy string
-		// _, err := fmt.Scanln(&dummy)
-		// _ = err
 		if !wincoe.WaitAnyKeyIfInteractive() {
 			fmt.Println("Didn't wait for keypress due to not an interactive/terminal.")
 		}
@@ -1061,23 +764,7 @@ func main() {
 	}
 
 	if exists {
-		// redPrintf("Warning: default gateway already exists on this interface: %d.%d.%d.%d\n",
-		// 	byte(existingGW), byte(existingGW>>8), byte(existingGW>>16), byte(existingGW>>24))
-		// Fixed printing for BigEndian
-		// ip := *(*[4]byte)(unsafe.Pointer(&existingGW))
-		// var buf [15]byte
-		// n := formatIPv4(buf[:], existingGW)
-		// ip := string(buf[:n])
-		//fmt.Printf("Current gateway on interface: %d.%d.%d.%d\n",
-		// redPrintf("Warning: default gateway already exists on this interface: %d.%d.%d.%d\n",
-		// 	ip[0], ip[1], ip[2], ip[3])
-
-		//normalized := bits.ReverseBytes32(existingGW)
 		fmt.Printf("raw:        0x%08X\n", existingGW)
-		//fmt.Printf("normalized: 0x%08X\n", normalized)
-		//redPrintf("Warning: default gateway already exists on this interface: %s", ipv4String(existingGW))//wrong order
-		//fmt.Println(ipv4String(normalized))
-		//redPrintf("Warning: default gateway already exists on this interface: %s", ipv4StringBE(normalized))
 		redPrintf("Warning: default gateway already exists on this interface: %s\n", ipv4StringLE(existingGW))
 	}
 
@@ -1153,7 +840,6 @@ func main() {
 	// 3. THE WAITING ROOM
 	cautionPrintf("\n>>> Gateway is ACTIVE. Internet is routed.\n")
 	cautionPrintf(">>> Press Ctrl+C to disconnect and cleanup.\n")
-	//fmt.Println("Default gateway set. Press Ctrl+C to exit and remove it.")
 
 	// Catch Ctrl+C to remove gateway on exit
 	c := make(chan os.Signal, 1)
