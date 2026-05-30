@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+echo building WITH console I/O
 
 :: 0. Capture Workspace State
 :: Run this BEFORE you 'set GOWORK=off' if you want to know the original state
@@ -27,7 +28,7 @@ if "!HAS_WORKSPACE!"=="1" (
 )
 
 ::if running as admin must get back to current dir:
-cd /d "%~dp0"
+cd /d %~dp0
 
 ::echo Cleaning Go cache
 ::go clean -cache -modcache
@@ -41,13 +42,10 @@ echo Running go vet...
 :: Including dead branches
 :: Including code not exercised by tests
 ::go vet -mod=vendor ./...
-::go vet -mod=vendor -unsafeptr=false
-go vet !MOD_FLAG! -unsafeptr=false ./...
+go vet !MOD_FLAG! -unsafeptr=false
 if errorlevel 1 goto :fail
 
-::go build -mod=vendor .
-echo Running go build
-go build !MOD_FLAG! .
+go build !BUILD_WITH_RACE_DETECTOR! !MOD_FLAG! .
 if errorlevel 1 goto :fail
 ::pause
 

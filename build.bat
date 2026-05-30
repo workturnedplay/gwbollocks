@@ -45,8 +45,8 @@ echo Running go vet...
 go vet !MOD_FLAG! -unsafeptr=false
 if errorlevel 1 goto :fail
 
-echo Running go build
-go build !MOD_FLAG! -ldflags="-H=windowsgui" .
+echo Building
+go build !BUILD_WITH_RACE_DETECTOR! !MOD_FLAG! -ldflags="-H=windowsgui" .
 if errorlevel 1 goto :fail
 
 ::When you build with: -ldflags "-H=windowsgui"
