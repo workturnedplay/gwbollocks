@@ -36,6 +36,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -47,7 +48,23 @@ import (
 // wincoe.Logger = slog.Default()
 //
 // this way this wincoe lib will log to where caller wants.
-var Logger *slog.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+// var Logger *slog.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+// Logger is stored behind an atomic.Pointer because it can be swapped
+// concurrently (dnsbollocks.LoggerManager.ApplyConfig does this on every
+// config Reload) while other goroutines are reading it via panic2() from
+// arbitrary wincoe call paths — DNS/UDP/TCP request handling can reach rare
+// defensive panics in this package (e.g. PidAndExeForUDP's bounds check,
+// impossibiru() inside callWithRetry) at any time. A plain *slog.Logger
+// package var here would be a genuine, -race-detectable data race between
+// Reload() and any in-flight request hitting one of those paths.
+//
+// Set via: wincoe.Logger.Store(someLogger)
+// Read via: wincoe.Logger.Load()
+var Logger atomic.Pointer[slog.Logger]
+
+func init() {
+	Logger.Store(slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
 
 var (
 	procSetConsoleTextAttribute = NewBoundProc(Kernel32, "SetConsoleTextAttribute", CheckBool)
@@ -151,7 +168,11 @@ func EnableVirtualTerminalProcessing() error {
 	}
 
 	mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING
-	return windows.SetConsoleMode(hStdout, mode)
+	if err2 := windows.SetConsoleMode(hStdout, mode); err2 != nil {
+		return fmt.Errorf("EnableVirtualTerminalProcessing failed: %w", err2)
+	} else {
+		return nil
+	}
 }
 
 // WithConsoleColor temporarily changes text attribute, runs fn, then restores original
@@ -193,8 +214,8 @@ func GetConsoleScreenBufferAttributes(outputHandle windows.Handle) (uint16, erro
 
 // SetConsoleTextAttribute used to set the color for the text next printed on console
 func SetConsoleTextAttribute(h windows.Handle, color uint16) error {
-	_, _, err := procSetConsoleTextAttribute.Call(uintptr(h), uintptr(color))
-	return err
+	res := procSetConsoleTextAttribute.Call(uintptr(h), uintptr(color))
+	return res.Err
 }
 
 /*
@@ -242,11 +263,6 @@ type keyEventRecord struct {
 	ControlKeyState uint32
 }
 
-var (
-	procReadConsoleInputW = Kernel32.NewProc("ReadConsoleInputW")
-	procPeekConsoleInputW = Kernel32.NewProc("PeekConsoleInputW")
-)
-
 const (
 	KEY_EVENT = 0x0001
 	VK_RETURN = 0x0D // Virtual Key Code for Enter/Carriage Return
@@ -255,24 +271,33 @@ const (
 // ClearStdin inspects and consumes all pending console input events.
 // Returns true if any KEY_EVENT with BKeyDown was observed.
 // It peeks first to avoid blocking reads.
+//
+// This is best-effort: failures are logged (via wincoe.Logger) but do not
+// abort the program — we still return whatever partial state we collected.
+// Thread-safety note: console handle access is inherently racy if other
+// goroutines manipulate stdin mode concurrently. Callers (WaitAnyKey etc.)
+// already wrap this in WithConsoleEventRaw which does its own mode protection.
 func ClearStdin() (hadKey bool) {
 	h := syscall.Handle(os.Stdin.Fd())
-
-	hadKey = false // be explicit
+	log := Logger.Load() // safe atomic read
 
 	for {
 		// Peek a single event (non-destructive, non-blocking).
 		var peekRec inputRecord
 		var peekCount uint32
-		r1, _, err := procPeekConsoleInputW.Call(
+
+		res1 := procPeekConsoleInputW.Call(
 			uintptr(h),
 			uintptr(unsafe.Pointer(&peekRec)),
 			uintptr(1),
 			uintptr(unsafe.Pointer(&peekCount)),
 		)
-		if r1 == 0 {
-			// syscall error — be conservative and stop looping
-			_ = err
+		if res1.Failed() { //err != nil {
+			// Failure on Peek — log and stop. This is usually transient or
+			// indicates stdin is no longer a console.
+			log.Warn("ClearStdin: PeekConsoleInputW failed",
+				slog.String("operation", "PeekConsoleInputW"),
+				SafeErr(res1.Err))
 			break
 		}
 		if peekCount == 0 {
@@ -283,15 +308,17 @@ func ClearStdin() (hadKey bool) {
 		// There's at least one event, now consume one event for real.
 		var rec inputRecord
 		var read uint32
-		r1, _, err = procReadConsoleInputW.Call(
+
+		res2 := procReadConsoleInputW.Call(
 			uintptr(h),
 			uintptr(unsafe.Pointer(&rec)),
 			uintptr(1),
 			uintptr(unsafe.Pointer(&read)),
 		)
-		if r1 == 0 {
-			// read failed; stop
-			_ = err
+		if res2.Failed() { // != nil {
+			log.Warn("ClearStdin: ReadConsoleInputW failed",
+				slog.String("operation", "ReadConsoleInputW"),
+				SafeErr(res2.Err))
 			break
 		}
 		if read == 0 {
@@ -313,7 +340,7 @@ func ClearStdin() (hadKey bool) {
 		// otherwise keep looping until no events left
 	}
 
-	return hadKey
+	return hadKey // explicit return for clarity (though bare "return" also works)
 }
 
 // WithConsoleEventRaw
@@ -331,8 +358,18 @@ func WithConsoleEventRaw(fn func()) {
 	newMode &^= windows.ENABLE_LINE_INPUT
 	newMode &^= windows.ENABLE_ECHO_INPUT
 
-	_ = windows.SetConsoleMode(h, newMode)
-	defer windows.SetConsoleMode(h, oldMode)
+	if err := windows.SetConsoleMode(h, newMode); err != nil {
+		log := Logger.Load() // safe atomic read
+		log.Warn("WithConsoleEventRaw: SetConsoleMode failed to enter raw mode", SafeErr(err))
+		// still proceed — we want to run fn() even if mode change is partial
+	}
+	defer func() {
+		log := Logger.Load() // safe atomic read
+		err2 := windows.SetConsoleMode(h, oldMode)
+		if err2 != nil {
+			log.Warn("WithConsoleEventRaw: SetConsoleMode failed to restore old mode", SafeErr(err2))
+		}
+	}()
 
 	fn()
 }
@@ -361,7 +398,8 @@ func IsStdinConsoleInteractive() bool {
 
 	// G115 Fix: Ensure the uintptr fits into a signed int
 	if fdPtr > math.MaxInt {
-		//TODO: should we log this? Logger.slog
+		//doneTODO: should we log this? Logger.slog
+		GetBugLogger().Warn("fdPtr exceeded math.MaxInt", slog.Uint64("fdPtr", uint64(fdPtr)))
 		return false
 	}
 
@@ -423,32 +461,142 @@ func Flush() {
 }
 
 // WinCheckFunc defines a predicate used to determine if a Windows API call failed
-// based on its primary return value (r1).
-type WinCheckFunc func(r1 uintptr) bool
+// based on its primary return value (r1). So true means it failed.
+type WinCheckFunc func(r1 uintptr, callErr error) bool
 
 var (
 	// CheckBool identifies a failure for functions returning a Windows BOOL in r1.
 	// In the Windows API, a 0 (FALSE) indicates that the function failed.
-	CheckBool WinCheckFunc = func(r1 uintptr) bool { return r1 == 0 }
+	CheckBool WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == 0 }
 
 	// CheckHandle identifies a failure for functions returning a HANDLE in r1.
 	// Many Windows APIs return INVALID_HANDLE_VALUE (all bits set to 1) on failure.
 	// ^uintptr(0) is the Go-idiomatic way to represent -1 as an unsigned pointer.
-	CheckHandle WinCheckFunc = func(r1 uintptr) bool { return r1 == ^uintptr(0) }
+	CheckHandle WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == ^uintptr(0) }
 
 	// CheckNull identifies a failure for functions returning a pointer or a handle in r1
 	// where a NULL value (0) indicates the operation could not be completed.
-	CheckNull WinCheckFunc = func(r1 uintptr) bool { return r1 == 0 }
+	CheckNull WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == 0 }
 
 	// CheckHRESULT identifies a failure for functions that return an HRESULT in r1.
 	// An HRESULT is a 32-bit value where a negative number (high bit set)
 	// indicates an error, while 0 or positive values indicate success.
-	CheckHRESULT WinCheckFunc = func(r1 uintptr) bool { return int32(r1) < 0 }
+	/*
+			HRESULT (COM / User-mode Win32)
+
+		HRESULT is used by COM (Component Object Model) and high-level user-mode APIs. It only allocates 1 bit for Severity:
+
+		    0 (Success): S_OK (0x00000000) or S_FALSE (0x00000001)
+
+		    1 (Failure): E_FAIL (0x80004005)
+	*/
+	CheckHRESULT WinCheckFunc = func(r1 uintptr, _ error) bool { return int32(r1) < 0 }
 
 	// CheckErrno identifies a failure for Win32 APIs that return a DWORD error code in r1.
 	// In this convention, 0 (ERROR_SUCCESS) means success, any non-zero value is a failure.
-	CheckErrno WinCheckFunc = func(r1 uintptr) bool { return r1 != 0 }
+	CheckErrno WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 != 0 }
+
+	// CheckAdjustTokenPrivileges handles both FALSE returns and the partial-success
+	// state where some privileges could not be assigned (ERROR_NOT_ALL_ASSIGNED).
+	CheckAdjustTokenPrivileges WinCheckFunc = func(r1 uintptr, callErr error) bool {
+		// Layer 1: If the API returned FALSE (0), the entire call failed.
+		if r1 == 0 {
+			return true
+		}
+
+		// Layer 2: The API returned TRUE, but check if it partially failed.
+		// Go's syscall/windows wrappers always return a non-nil error tracking GetLastError().
+		if callErr != nil && errors.Is(callErr, windows.ERROR_NOT_ALL_ASSIGNED) {
+			return true // Treat partial assignment as a failure state
+		}
+
+		return false
+	}
+
+	// CheckZero indicates failure if the API returns 0 (useful for counts, lengths, IDs)
+	CheckZero WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == 0 }
+
+	// CheckMinusOne indicates failure if the API returns -1 (specifically for GetMessage)
+	CheckMinusOne WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == ^uintptr(0) }
+
+	// CheckNone never fails. Used for VOID returns or LRESULTs that require manual checking.
+	CheckNone WinCheckFunc = func(_ uintptr, _ error) bool { return false }
+
+	// CheckNTSTATUS indicates failure if the NTSTATUS code is negative
+	/*
+			NTSTATUS (Kernel / Native API)
+
+		NTSTATUS is used by the NT Kernel and native APIs (found in ntdll.dll). Its top 2 bits represent Severity:
+
+		    00 (Success): STATUS_SUCCESS (0x00000000)
+
+		    01 (Informational): STATUS_PENDING (0x00000103)
+
+		    10 (Warning): STATUS_BUFFER_OVERFLOW (0x80000005)
+
+		    11 (Error): STATUS_ACCESS_DENIED (0xC0000022)
+
+		Because Warnings (10...) and Errors (11...) both have the highest bit (bit 31) set, they both evaluate as negative integers (< 0).
+	*/
+	//XXX: not collapsing it to same impl. as CheckHRESULT on purpose!
+	CheckNTSTATUS WinCheckFunc = func(r1 uintptr, _ error) bool { return int32(r1) < 0 }
+
+	//for GetThreadPriority which returns r1 as int,
+	CheckThreadPriority WinCheckFunc = func(r1 uintptr, _ error) bool {
+		return int32(r1) == THREAD_PRIORITY_ERROR_RETURN // aka 0x7fffffff // aka THREAD_PRIORITY_ERROR_RETURN
+	}
+
+	CheckCLRInvalid WinCheckFunc = func(r1 uintptr, _ error) bool {
+		return uint32(r1) == CLR_INVALID // aka 0xffffffff
+	}
+
+	CheckGDIError WinCheckFunc = func(r1 uintptr, _ error) bool {
+		return uint32(r1) == GDIError // aka 0xffffffff
+	}
+
+	// CheckStringLength returns true (failure) only if r1 is 0 AND an actual error is set.
+	CheckStringLength WinCheckFunc = func(r1 uintptr, callErr error) bool {
+		if r1 == 0 {
+			if callErr != nil && !errors.Is(callErr, windows.ERROR_SUCCESS) {
+				return true // It's a real failure
+			}
+		}
+		return false // It's just an empty string
+	}
 )
+
+const CLR_INVALID uint32 = 0xffffffff
+const GDIError = uint32(0xffffffff)
+
+// side effect of returning a struct like this is that we don't get warned for not handling the returned Err or CallStatus errors! in a way it's good because CallStatus is rarely checked! just Err is checked usually.
+type WinResult struct {
+	R1 uintptr
+	R2 uintptr
+	// exactly the third return value from LazyProc.Call; may contain additional status information even when Err == nil.
+	//
+	// Raw status returned by LazyProc.Call. Usually ERROR_SUCCESS
+	// on successful calls, but some Win32 APIs use it to report
+	// additional success information (e.g. ERROR_ALREADY_EXISTS).
+	CallStatus error
+
+	Err error // normalized according to the Check* function
+}
+
+func (r WinResult) Failed() bool {
+	return r.Err != nil
+}
+
+func (r WinResult) Succeeded() bool {
+	return r.Err == nil
+}
+
+func (r WinResult) ErrIs(target error) bool {
+	return errors.Is(r.Err, target)
+}
+
+func (r WinResult) CallStatusIs(target error) bool {
+	return errors.Is(r.CallStatus, target)
+}
 
 // CheckWinResult processes a Windows API result.
 //
@@ -471,7 +619,7 @@ func CheckWinResult(
 	r1 uintptr,
 	callErr error,
 ) error {
-	if !isFailure(r1) {
+	if !isFailure(r1, callErr) {
 		// Success: return nil so 'if err != nil' behaves normally.
 		return nil
 	}
@@ -517,6 +665,7 @@ func CheckWinResult(
 
 // UnspecifiedWinApi is the string used when empty op name is used
 const UnspecifiedWinApi string = "unspecified_winapi"
+const THREAD_PRIORITY_ERROR_RETURN int32 = 0x7fffffff
 
 // LazyProcish is the minimal interface that WinCall needs from a LazyProc-like object.
 //
@@ -529,6 +678,7 @@ type LazyProcish interface {
 	// Call invokes the Windows procedure with the given arguments.
 	// Signature must match windows.LazyProc.Call exactly.
 	Call(a ...uintptr) (r1, r2 uintptr, lastErr error)
+	Find() error
 }
 
 // realLazyProc wraps *windows.LazyProc to satisfy LazyProcish.
@@ -575,11 +725,11 @@ func RealProc(p *windows.LazyProc) LazyProcish {
 //   - if name is empty or whitespace-only
 func RealProc2(dll *windows.LazyDLL, name string) LazyProcish {
 	if dll == nil {
-		panic("RealProc2: nil dll")
+		panic2("RealProc2: nil dll")
 	}
 	name = strings.TrimSpace(name)
 	if name == "" {
-		panic("RealProc2: empty proc name")
+		panic2("RealProc2: empty proc name")
 	}
 	return RealProc(dll.NewProc(name))
 }
@@ -619,8 +769,14 @@ type BoundProc struct {
 // the heap, ensuring its memory address remains stable even if the stack grows.
 //
 //go:uintptrescapes
-func (b *BoundProc) Call(args ...uintptr) (uintptr, uintptr, error) {
+func (b *BoundProc) Call(args ...uintptr) WinResult {
 	return WinCall(b.Proc, b.Check, args...)
+}
+
+// Find attempts to locate the procedure in the DLL.
+// Returns nil if the procedure is successfully found, or an error if it is not.
+func (b *BoundProc) Find() error {
+	return b.Proc.Find()
 }
 
 // NewBoundProc initializes a BoundProc by resolving a procedure from the
@@ -635,7 +791,7 @@ func (b *BoundProc) Call(args ...uintptr) (uintptr, uintptr, error) {
 // It panics if the check function is nil.
 func NewBoundProc(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc {
 	if check == nil {
-		panic("NewBoundProc: nil WinCheckFunc passed as arg")
+		panic2("NewBoundProc: nil WinCheckFunc passed as arg")
 	}
 
 	return &BoundProc{
@@ -661,9 +817,9 @@ func NewBoundProc(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundP
 // Otherwise, use BoundProc.Call for better type organization.
 //
 //go:uintptrescapes
-func WinCall(proc LazyProcish, check WinCheckFunc, args ...uintptr) (uintptr, uintptr, error) {
+func WinCall(proc LazyProcish, check WinCheckFunc, args ...uintptr) WinResult {
 	if proc == nil {
-		panic(fmt.Errorf("WinCall: nil proc"))
+		panic2("WinCall: nil proc")
 	}
 
 	op := strings.TrimSpace(proc.Name())
@@ -672,9 +828,14 @@ func WinCall(proc LazyProcish, check WinCheckFunc, args ...uintptr) (uintptr, ui
 	}
 	// args is a []uintptr, but because of //go:uintptrescapes, the caller
 	// has already pinned the memory safely before we get here.
-	r1, r2, callErr := proc.Call(args...)
-	err := CheckWinResult(op, check, r1, callErr)
-	return r1, r2, err
+	r1, r2, callStatus := proc.Call(args...)
+	//XXX: don't put anything here, which might call a syscall or it might delete the last error for a potential future GetLastError() call.
+	return WinResult{
+		R1:         r1,
+		R2:         r2,
+		CallStatus: callStatus,
+		Err:        CheckWinResult(op, check, r1, callStatus),
+	}
 }
 
 var (
@@ -693,6 +854,11 @@ var (
 
 	//procWriteConsoleInputW = Kernel32.NewProc("WriteConsoleInputW")
 	procWriteConsoleInputW = NewBoundProc(Kernel32, "WriteConsoleInputW", CheckBool)
+
+	//procReadConsoleInputW = Kernel32.NewProc("ReadConsoleInputW")
+	//procPeekConsoleInputW = Kernel32.NewProc("PeekConsoleInputW")
+	procPeekConsoleInputW = NewBoundProc(Kernel32, "PeekConsoleInputW", CheckBool)
+	procReadConsoleInputW = NewBoundProc(Kernel32, "ReadConsoleInputW", CheckBool)
 )
 
 // auto runs before main(), loads the DLLs non-lazily.
@@ -704,7 +870,7 @@ func init() {
 func loadDll(dll *windows.LazyDLL) {
 	err := dll.Load()
 	if err != nil {
-		panic("critical system dll " + dll.Name + " not found, error: " + err.Error())
+		panic2("critical system dll " + dll.Name + " not found, error: " + err.Error())
 	}
 }
 
@@ -749,7 +915,7 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 
 		if err == nil {
 			if uint64(size) > uint64(len(buf)) {
-				panic("impossible: size is bigger than len(buf)")
+				impossibiru("size is bigger than len(buf)")
 			}
 			return buf, nil // epic fail here if returning buf[:size] because size is 0 even tho servicesReturned is > 0
 			//return buf[:size], nil // fixed one issue! nope this "fix" was wrong because: The size parameter is only reliable when the API returns ERROR_MORE_DATA or ERROR_INSUFFICIENT_BUFFER. On success it is frequently set to 0, even when the buffer contains real data.
@@ -825,7 +991,7 @@ func boolToUintptr(b bool) uintptr {
 //     to a specific struct layout; build a typed parser on top if needed.
 func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 	return callWithRetry("GetExtendedUDPTable", 0, func(bufPtr *byte, s *uint32) error {
-		_, _, err := procGetExtendedUdpTable.Call(
+		res1 := procGetExtendedUdpTable.Call(
 			uintptr(unsafe.Pointer(bufPtr)),
 			uintptr(unsafe.Pointer(s)),
 			boolToUintptr(order),
@@ -833,7 +999,7 @@ func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 			uintptr(UDP_TABLE_OWNER_PID),
 			0,
 		)
-		return err
+		return res1.Err
 	})
 }
 
@@ -841,7 +1007,7 @@ func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 // It follows the same contract as GetExtendedUDPTable.
 func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 	return callWithRetry("GetExtendedTCPTable", 0, func(bufPtr *byte, s *uint32) error {
-		_, _, err := procGetExtendedTcpTable.Call(
+		res1 := procGetExtendedTcpTable.Call(
 			uintptr(unsafe.Pointer(bufPtr)),
 			uintptr(unsafe.Pointer(s)),
 			boolToUintptr(order),
@@ -849,7 +1015,7 @@ func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 			uintptr(TCP_TABLE_OWNER_PID_ALL), // Value 5: Get all states + PID
 			0,
 		)
-		return err
+		return res1.Err
 	})
 }
 
@@ -865,9 +1031,9 @@ func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 //
 // Returns a non-empty string and nil error on success, or an empty string with error on failure.
 func QueryFullProcessName(pid uint32) (string, error) {
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-	if err != nil {
-		return "", fmt.Errorf("OpenProcess failedfor PID %d: %w", pid, err)
+	h, err0 := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err0 != nil {
+		return "", fmt.Errorf("OpenProcess failedfor PID %d: %w", pid, err0)
 	}
 	defer windows.CloseHandle(h)
 
@@ -886,13 +1052,13 @@ func QueryFullProcessName(pid uint32) (string, error) {
 		// Note: QueryFullProcessNameW expects 'size' to include the null terminator
 		// on input, and returns the length WITHOUT the null terminator on success.
 
-		_, _, err = procQueryFullProcessName.Call(
+		res1 := procQueryFullProcessName.Call(
 			uintptr(h),
 			0,
 			uintptr(unsafe.Pointer(&buf[0])),
 			uintptr(unsafe.Pointer(&size)),
 		)
-		if err == nil {
+		if res1.Succeeded() { //err == nil {
 			// Success! Convert the returned size to string
 			//UTF16ToString is a function that looks for a 0x0000 (null).
 			//size is just a number the API handed back, so let's not trust it, thus use full 'buf'
@@ -901,8 +1067,9 @@ func QueryFullProcessName(pid uint32) (string, error) {
 
 		// Check if the error is specifically "Buffer too small"
 		// syscall.ERROR_INSUFFICIENT_BUFFER = 0x7A
-		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
-			return "", fmt.Errorf("QueryFullProcessNameW failed after %d tries, err: '%w'", tries, err)
+		//if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+		if !res1.ErrIs(windows.ERROR_INSUFFICIENT_BUFFER) {
+			return "", fmt.Errorf("QueryFullProcessNameW failed after %d tries, err: '%w'", tries, res1.Err)
 		}
 		//else the desired 'size' now includes the nul terminator, so no need to +1 it
 
@@ -930,10 +1097,66 @@ func QueryFullProcessName(pid uint32) (string, error) {
 }
 
 func impossibiru(msg string) {
-	panic(fmt.Sprintf("Impossible: '%s'", msg))
+	msg2 := fmt.Sprintf("Impossible: '%s'", msg)
+	panic2(msg2)
+}
+func panic2(msg string) {
+	GetBugLogger().Error(msg)
+	panic(msg)
 }
 
-// exePathFromPID returns process image path for pid or an error.
+// bugLogger is a package-level fallback logger used only by free functions
+// (not methods on Server/AdminUI) that need to log a BUG-class invariant
+// violation immediately before panicking, but have no logger threaded to them.
+// Kept in sync with the active logger via applyLogger. Falls back to
+// slog.Default() before logging is initialized (mirrors Server.getLogger()'s
+// own fallback behavior).
+var bugLogger atomic.Pointer[slog.Logger]
+
+func SetBugLogger(newLogger *slog.Logger) {
+	bugLogger.Store(newLogger)
+}
+
+func GetBugLogger() *slog.Logger {
+	if l := bugLogger.Load(); l != nil {
+		return l
+	}
+	//def := slog.Default()
+	def := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	return def
+}
+
+// GetLoggerOrFallback is the single owner of the "load the current logger
+// from a shared, hot-swappable atomic.Pointer[slog.Logger], falling back to
+// the process-wide bug logger when it hasn't been initialized yet" behavior.
+//
+// Every type that holds a live, reloadable logger reference — Server (via
+// Runtime/LoggerManager), AdminUI, UpstreamManager, Upstream,
+// FailoverSelector, LoggerManager itself, GenericSafeFileWriter, and
+// win11SafeFileWriter — used to hand-roll this exact nil-check-then-fallback
+// dance in its own getLogger() method, each with slightly different guards
+// and message text. This function is now the one place that logic lives;
+// every such getLogger() should be a one-line delegate to it.
+//
+// ptr may itself be nil (some callers hold *atomic.Pointer[slog.Logger] as
+// an optional field, e.g. before full initialization); that is treated
+// identically to a non-nil ptr that hasn't had Store() called on it yet.
+// ownerDesc identifies the calling type/field (e.g. "AdminUI.liveLogger") for
+// the diagnostic message logged through the fallback logger.
+func GetLoggerOrFallback(ptr *atomic.Pointer[slog.Logger], ownerDesc string) *slog.Logger {
+	if ptr != nil {
+		if l := ptr.Load(); l != nil {
+			return l
+		}
+	}
+	log := GetBugLogger()
+	log.Error("BUG: " + ownerDesc + " wasn't initialized before use; using fallback bug logger")
+	return log
+}
+
+// ExePathFromPID returns process image path for pid or an error.
 // Uses QueryFullProcessImageNameW. May fail if insufficient privilege.
 //
 // ExePathFromPID retrieves the full executable path of a process by PID.
@@ -961,7 +1184,7 @@ func GetProcessName(pid uint32) (string, error) {
 	err = Process32First(snapshot, &entry)
 	for err == nil {
 		if count > maxProcessEntries {
-			return "", fmt.Errorf("Process32 enumeration exceeded safety limit")
+			return "", fmt.Errorf("Process32 enumeration exceeded safety limit of %d active processes currently running", maxProcessEntries)
 		}
 		count++
 		//doneTODO: make a hard limit here, so it doesn't loop infinitely just in case.
@@ -1008,14 +1231,14 @@ func GetProcessName(pid uint32) (string, error) {
 // If a flag isn’t used (e.g., you don’t include TH32CS_SNAPPROCESS), CreateToolhelp32Snapshot will not include that object type in the snapshot.
 // TH32CS_SNAPPROCESS specifically tells the API to include all processes in the snapshot. Without it, Process32First/Process32Next won’t enumerate any processes.
 func CreateToolhelp32Snapshot(dwFlags, th32ProcessID uint32) (windows.Handle, error) {
-	r1, _, err := procCreateToolhelp32Snapshot.Call(
+	res1 := procCreateToolhelp32Snapshot.Call(
 		uintptr(dwFlags),
 		uintptr(th32ProcessID),
 	)
-	if err != nil {
-		return 0, err
+	if res1.Failed() { //err != nil {
+		return 0, res1.Err
 	}
-	return windows.Handle(r1), nil
+	return windows.Handle(res1.R1), nil
 }
 
 // Process32First wraps callProcess32First.
@@ -1023,8 +1246,8 @@ func Process32First(snapshot windows.Handle, entry *windows.ProcessEntry32) erro
 	if entry == nil {
 		return errors.New("Process32First: nil entry")
 	}
-	_, _, err := procProcess32First.Call(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
-	return err
+	res1 := procProcess32First.Call(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
+	return res1.Err
 }
 
 // Process32Next wraps callProcess32Next.
@@ -1032,8 +1255,8 @@ func Process32Next(snapshot windows.Handle, entry *windows.ProcessEntry32) error
 	if entry == nil {
 		return errors.New("Process32Next: nil entry")
 	}
-	_, _, err := procProcess32Next.Call(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
-	return err
+	res1 := procProcess32Next.Call(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
+	return res1.Err
 }
 
 // GetServiceNamesFromPIDUncached queries the Service Control Manager to find all service
@@ -1093,11 +1316,15 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 			&currentResumeHandle,
 			nil,
 		)
-		return errEnum
+		if errEnum == nil {
+			return nil
+		} else {
+			return fmt.Errorf("EnumServicesStatusEx failed0: %w", errEnum)
+		}
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("EnumServicesStatusEx failed: %w", err)
+		return nil, fmt.Errorf("EnumServicesStatusEx wrapped by callWithRetry, failed: %w", err)
 	}
 	if buffer == nil {
 		return nil, fmt.Errorf("nil buffer from callWithRetry, no error though")
@@ -1148,102 +1375,154 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 	return serviceNames, nil
 }
 
-// pidAndExeForUDP returns (pid, exePath_or_exeName, error).
-// clientAddr should be the remote UDP address observed on the server side (e.g., 127.0.0.1:49936).
+// PidAndExeForUDP returns (pid, exePath_or_exeName, error).
+// clientAddr should be the remote UDP address observed on the server side.
 func PidAndExeForUDP(clientAddr *net.UDPAddr) (uint32, string, error) {
 	//capital P in PidAndExeForUDP means exported, apparently!
 	if clientAddr == nil {
 		return 0, "", errors.New("nil clientAddr")
 	}
-	ip4 := clientAddr.IP.To4()
-	if ip4 == nil {
-		return 0, "", errors.New("only IPv4 supported")
+
+	ip := clientAddr.IP
+	if clientAddr.Port < 0 || clientAddr.Port > 65535 {
+		return 0, "", fmt.Errorf("invalid network port: %d", clientAddr.Port)
 	}
 	port := uint16(clientAddr.Port)
 
-	buf, err := GetExtendedUDPTable(false, AF_INET)
+	isIPv4 := ip.To4() != nil
+	family := uint32(AF_INET)
+	if !isIPv4 {
+		family = AF_INET6
+	}
+
+	buf, err := GetExtendedUDPTable(false, family)
 	if err != nil {
-		return 0, "", err
+		return 0, "", fmt.Errorf("GetExtendedUDPTable failed while resolving pid/exe for UDP client %s: %w", clientAddr, err)
 	}
 
 	if buf == nil {
 		return 0, "", errors.New("GetExtendedUdpTable returned empty buffer which means there were no UDP entries in the table")
+
 	}
 
 	// Buffer layout: DWORD dwNumEntries; then array of MIB_UDPROW_OWNER_PID entries.
 	if len(buf) < 4 {
 		return 0, "", errors.New("GetExtendedUdpTable returned too small buffer")
 	}
+
 	num := binary.LittleEndian.Uint32(buf[:4])
-	const rowSize = 12 // MIB_UDPROW_OWNER_PID has 3 DWORDs = 12 bytes
 	offset := 4
-	//var owningPid uint32
-	for i := uint32(0); i < num; i++ {
-		if offset+rowSize > len(buf) {
-			panic(fmt.Sprintf("attempted to read beyond buffer in buf=%p len(buf)=%d offset=%d rowSize=%d i=%d\n", buf, len(buf), offset, rowSize, i))
-			//break
-		}
-		localAddr := binary.LittleEndian.Uint32(buf[offset : offset+4])
-		localPortRaw := binary.LittleEndian.Uint32(buf[offset+4 : offset+8])
 
-		// localPortRaw stores port in network byte order in low 16 bits.
-		localPort := uint16(localPortRaw & 0xFFFF)
-		localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8 // convert to host order
+	//for i := uint32(0); i < num; i++ {
+	for i := range num {
+		if isIPv4 {
+			// MIB_UDPROW_OWNER_PID (12 bytes)
+			const rowSize = 12 // MIB_UDPROW_OWNER_PID has 3 DWORDs = 12 bytes
+			if offset+rowSize > len(buf) {
+				// Defense-in-depth: reached on every incoming UDP DNS packet(in dnsbollocks), so never panic on
+				// OS-returned telemetry here — mirrors PidAndExeForTCP's handling of the
+				// identical situation below in this same file. A transient race between the size
+				// query and the data fetch can occasionally yield a count*rowSize that doesn't
+				// fit; treat it as "no more entries to scan" instead of crashing the resolver.
+				GetBugLogger().Error(fmt.Sprintf("attempted to read beyond buffer in buf=%p len(buf)=%d offset=%d rowSize=%d i=%d\n", buf, len(buf), offset, rowSize, i))
+				break
+			}
+			localAddr := binary.LittleEndian.Uint32(buf[offset : offset+4])
+			localPortRaw := binary.LittleEndian.Uint32(buf[offset+4 : offset+8])
+			owningPid := binary.LittleEndian.Uint32(buf[offset+8 : offset+12])
+			//prepare for next entry
+			offset += rowSize
+			// localPortRaw stores port in network byte order in low 16 bits.
+			localPort := uint16(localPortRaw & 0xFFFF)
+			localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8 // convert to host order
 
-		// convert DWORD IP (little-endian) to net.IP
-		ipb := []byte{
-			byte(localAddr & 0xFF),
-			byte((localAddr >> 8) & 0xFF),
-			byte((localAddr >> 16) & 0xFF),
-			byte((localAddr >> 24) & 0xFF),
-		}
-		entryIP := net.IPv4(ipb[0], ipb[1], ipb[2], ipb[3])
+			// convert DWORD IP (little-endian) to net.IP
+			ipb := []byte{
+				byte(localAddr & 0xFF),
+				byte((localAddr >> 8) & 0xFF),
+				byte((localAddr >> 16) & 0xFF),
+				byte((localAddr >> 24) & 0xFF),
+			}
+			entryIP := net.IPv4(ipb[0], ipb[1], ipb[2], ipb[3])
 
-		if localPort == port {
-			// treat 0.0.0.0 as wildcard match
-			if entryIP.Equal(net.IPv4zero) || entryIP.Equal(ip4) {
-				// found PID for our IP:port tuple
-				owningPid := binary.LittleEndian.Uint32(buf[offset+8 : offset+12])
-				exe, err := ExePathFromPID(owningPid)
-				if err != nil {
-					// got error due to permissions needed for abs. path? this will work but it's just the .exe:
+			if localPort == port && (entryIP.Equal(net.IPv4zero) || entryIP.Equal(ip.To4())) { // treat 0.0.0.0 as wildcard match
+				exe, err2 := ExePathFromPID(owningPid)
+				if err2 != nil {
+					var err3 error
+					exe, err3 = GetProcessName(owningPid)
+					if err3 != nil {
+						return 0, "", fmt.Errorf("pid %d not found for %s, errTransient:'%v', err:'%w'", owningPid, clientAddr.String(), err2, err3)
+					}
+				}
+				return owningPid, exe, nil
+			}
+		} else {
+			// MIB_UDP6ROW_OWNER_PID (28 bytes)
+			// ucLocalAddr[16], dwLocalScopeId, dwLocalPort, dwOwningPid
+			const rowSize = 28
+			if offset+rowSize > len(buf) {
+				//See the identical comment in the isIPv4 branch above.
 
-					var err2 error // Declare err2 so we don't have to use :=
-					exe, err2 = GetProcessName(owningPid)
+				//panic2(fmt.Sprintf("attempted to read beyond buffer in buf=%p len(buf)=%d offset=%d rowSize=%d i=%d\n", buf, len(buf), offset, rowSize, i))
+				GetBugLogger().Error(fmt.Sprintf("attempted to read beyond buffer in buf=%p len(buf)=%d offset=%d rowSize=%d i=%d\n", buf, len(buf), offset, rowSize, i))
+				break
+			}
 
-					if err2 != nil {
-						return 0, "", fmt.Errorf("pid %d not found for %s, errTransient:'%v', err:'%w'", owningPid, clientAddr.String(), err, err2)
+			localIPBytes := buf[offset : offset+16]
+			// offset+16 to offset+20 is dwLocalScopeId (skipped)
+			localPortRaw := binary.LittleEndian.Uint32(buf[offset+20 : offset+24])
+			owningPid := binary.LittleEndian.Uint32(buf[offset+24 : offset+28])
+			offset += rowSize
+
+			localPort := uint16(localPortRaw & 0xFFFF)
+			localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8
+
+			entryIP := net.IP(localIPBytes)
+
+			if localPort == port && (entryIP.Equal(net.IPv6zero) || entryIP.Equal(ip)) {
+				exe, err2 := ExePathFromPID(owningPid)
+				if err2 != nil {
+					var err3 error
+					exe, err3 = GetProcessName(owningPid)
+					if err3 != nil {
+						return 0, "", fmt.Errorf("pid %d not found for %s, errTransient:'%v', err:'%w'", owningPid, clientAddr.String(), err2, err3)
 					}
 				}
 				return owningPid, exe, nil
 			}
 		}
-
-		//prepare for next entry
-		offset += rowSize
 	} //for
 
 	return 0, "", fmt.Errorf("no matching UDP socket entry found for %s (ephemeral port reuse or socket already closed by kernel) thus dno who sent it", clientAddr.String())
 }
 
-// clientAddr should be the remote TCP address observed on the server side (e.g., 127.0.0.1:49936).
+// PidAndExeForTCP resolves the PID/Exe for a given client TCP connection.
+// clientAddr should be the remote TCP address observed on the server side.
 func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 	if clientAddr == nil {
 		return 0, "", errors.New("nil clientAddr")
 	}
-	ip4 := clientAddr.IP.To4()
-	if ip4 == nil {
-		return 0, "", errors.New("only IPv4 supported")
+
+	ip := clientAddr.IP
+	if clientAddr.Port < 0 || clientAddr.Port > 65535 {
+		return 0, "", fmt.Errorf("invalid network port: %d", clientAddr.Port)
 	}
 	port := uint16(clientAddr.Port)
 
-	// Fetch the table
-	buf, err := GetExtendedTCPTable(false, AF_INET) //FIXME: do I need here to include the AF_INET6 ?! probably, and for UDP func too!
+	isIPv4 := ip.To4() != nil
+	family := uint32(AF_INET)
+	if !isIPv4 {
+		family = AF_INET6
+	}
+
+	// Fetch the table using the dynamic address family
+	buf, err := GetExtendedTCPTable(false, family)
 	if err != nil {
-		return 0, "", err
+		return 0, "", fmt.Errorf("GetExtendedTCPTable failed while resolving pid/exe for TCP client %s: %w", clientAddr, err)
 	}
 	if buf == nil {
 		return 0, "", errors.New("GetExtendedTcpTable returned empty buffer")
+
 	}
 
 	if len(buf) < 4 {
@@ -1251,55 +1530,90 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 	}
 
 	num := binary.LittleEndian.Uint32(buf[:4])
-
-	// MIB_TCPROW_OWNER_PID structure:
-	// 0: dwState (4 bytes)
-	// 4: dwLocalAddr (4 bytes)
-	// 8: dwLocalPort (4 bytes)
-	// 12: dwRemoteAddr (4 bytes)
-	// 16: dwRemotePort (4 bytes)
-	// 20: dwOwningPid (4 bytes)
-	const rowSize = 24
 	offset := 4
 
-	for i := uint32(0); i < num; i++ {
-		if offset+rowSize > len(buf) {
-			break
-		}
+	//for i := uint32(0); i < num; i++ {
+	for i := range num {
+		if isIPv4 {
+			// MIB_TCPROW_OWNER_PID (24 bytes)
+			// MIB_TCPROW_OWNER_PID structure:
+			// 0: dwState (4 bytes)
+			// 4: dwLocalAddr (4 bytes)
+			// 8: dwLocalPort (4 bytes)
+			// 12: dwRemoteAddr (4 bytes)
+			// 16: dwRemotePort (4 bytes)
+			// 20: dwOwningPid (4 bytes)
+			const rowSize = 24
+			if offset+rowSize > len(buf) {
+				GetBugLogger().Error(fmt.Sprintf("attempted to read beyond buffer in buf=%p len(buf)=%d offset=%d rowSize=%d i=%d\n", buf, len(buf), offset, rowSize, i))
+				break
+			}
 
-		// Extract fields based on the 24-byte MIB_TCPROW_OWNER_PID layout
-		localAddrRaw := binary.LittleEndian.Uint32(buf[offset+4 : offset+8])
-		localPortRaw := binary.LittleEndian.Uint32(buf[offset+8 : offset+12])
-		owningPid := binary.LittleEndian.Uint32(buf[offset+20 : offset+24])
+			// Extract fields based on the 24-byte MIB_TCPROW_OWNER_PID layout
+			localAddrRaw := binary.LittleEndian.Uint32(buf[offset+4 : offset+8])
+			localPortRaw := binary.LittleEndian.Uint32(buf[offset+8 : offset+12])
+			owningPid := binary.LittleEndian.Uint32(buf[offset+20 : offset+24])
+			// Advance offset for next iteration
+			offset += rowSize
 
-		// Advance offset for next iteration
-		offset += rowSize
+			// Port conversion (Network Byte Order in low 16 bits)
+			localPort := uint16(localPortRaw & 0xFFFF)
+			localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8
 
-		// Port conversion (Network Byte Order in low 16 bits)
-		localPort := uint16(localPortRaw & 0xFFFF)
-		localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8
-
-		if localPort == port {
-			// Convert DWORD IP (little-endian) to net.IP
-			entryIP := net.IPv4(
-				byte(localAddrRaw&0xFF),
-				byte((localAddrRaw>>8)&0xFF),
-				byte((localAddrRaw>>16)&0xFF),
-				byte((localAddrRaw>>24)&0xFF),
-			)
-
-			// Match logic (Wildcard 0.0.0.0 or specific IP)
-			if entryIP.Equal(net.IPv4zero) || entryIP.Equal(ip4) {
-				exe, err := ExePathFromPID(owningPid)
-				if err != nil {
-					// Fallback to process name if path is inaccessible
-					var err2 error
-					exe, err2 = GetProcessName(owningPid)
+			if localPort == port {
+				// Convert DWORD IP (little-endian) to net.IP
+				entryIP := net.IPv4(
+					byte(localAddrRaw&0xFF),
+					byte((localAddrRaw>>8)&0xFF),
+					byte((localAddrRaw>>16)&0xFF),
+					byte((localAddrRaw>>24)&0xFF),
+				)
+				// Match logic (Wildcard 0.0.0.0 or specific IP)
+				if entryIP.Equal(net.IPv4zero) || entryIP.Equal(ip.To4()) {
+					exe, err2 := ExePathFromPID(owningPid)
 					if err2 != nil {
-						return 0, "", fmt.Errorf("pid %d found but exe lookup failed: %w", owningPid, err2)
+						var err3 error
+						exe, err3 = GetProcessName(owningPid)
+						if err3 != nil {
+							return 0, "", fmt.Errorf("pid %d found but exe lookup failed: %w", owningPid, err3)
+						}
 					}
+					return owningPid, exe, nil
 				}
-				return owningPid, exe, nil
+			}
+		} else {
+			// MIB_TCP6ROW_OWNER_PID (56 bytes)
+			// ucLocalAddr[16], dwLocalScopeId, dwLocalPort, ucRemoteAddr[16], dwRemoteScopeId, dwRemotePort, dwState, dwOwningPid
+			const rowSize = 56
+			if offset+rowSize > len(buf) {
+				GetBugLogger().Error(fmt.Sprintf("attempted to read beyond buffer in buf=%p len(buf)=%d offset=%d rowSize=%d i=%d\n", buf, len(buf), offset, rowSize, i))
+				break
+			}
+
+			localIPBytes := buf[offset : offset+16]
+			// offset+16 to offset+20 is dwLocalScopeId (skipped)
+			localPortRaw := binary.LittleEndian.Uint32(buf[offset+20 : offset+24])
+			// offset+24 to offset+52 contains remote info and state (skipped)
+			owningPid := binary.LittleEndian.Uint32(buf[offset+52 : offset+56])
+			offset += rowSize
+
+			localPort := uint16(localPortRaw & 0xFFFF)
+			localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8
+
+			if localPort == port {
+				entryIP := net.IP(localIPBytes)
+
+				if entryIP.Equal(net.IPv6zero) || entryIP.Equal(ip) {
+					exe, err2 := ExePathFromPID(owningPid)
+					if err2 != nil {
+						var err3 error
+						exe, err3 = GetProcessName(owningPid)
+						if err3 != nil {
+							return 0, "", fmt.Errorf("pid %d found but exe lookup failed: %w", owningPid, err3)
+						}
+					}
+					return owningPid, exe, nil
+				}
 			}
 		}
 	}
@@ -1367,8 +1681,13 @@ func InjectConsoleEnter() error {
 
 // InjectConsoleKey synthesizes a single virtual key down event
 // and writes it directly into the system's console input buffer.
-func InjectConsoleKey(vkCode uint16, scanCode uint16, char rune) error {
+func InjectConsoleKey(vkCode, scanCode uint16, char rune) error {
 	h := syscall.Handle(os.Stdin.Fd())
+
+	// Validate that the rune fits into a single UTF-16 code unit (Basic Multilingual Plane)
+	if char < 0 || char > 65535 {
+		return fmt.Errorf("character %U cannot fit into a single uint16 code unit", char)
+	}
 
 	var rec inputRecord
 	rec.EventType = KEY_EVENT
@@ -1378,7 +1697,7 @@ func InjectConsoleKey(vkCode uint16, scanCode uint16, char rune) error {
 	ke.RepeatCount = 1
 	ke.VirtualKeyCode = vkCode
 	ke.VirtualScanCode = scanCode
-	ke.UnicodeChar = uint16(char)
+	ke.UnicodeChar = uint16(char) // Safe now, gosec will be happy
 	ke.ControlKeyState = 0
 
 	var written uint32
@@ -1386,15 +1705,657 @@ func InjectConsoleKey(vkCode uint16, scanCode uint16, char rune) error {
 	// Execute via your custom BoundProc architecture wrapper
 	// WARNING: We must do the uintptr casting explicitly right here inside
 	// the arguments list to comply with //go:uintptrescapes memory pinning safety bounds.
-	_, _, err := procWriteConsoleInputW.Call(
+	res1 := procWriteConsoleInputW.Call(
 		uintptr(h),
 		uintptr(unsafe.Pointer(&rec)),
 		uintptr(1),
 		uintptr(unsafe.Pointer(&written)),
 	)
-	if err != nil || written != 1 {
-		return fmt.Errorf("InjectConsoleKey failed, written %d, err: %w", written, err)
+	if res1.Failed() || written != 1 {
+		return fmt.Errorf("InjectConsoleKey failed, written %d, err: %w", written, res1.Err)
 	}
 
 	return nil
 }
+
+var (
+	procReplaceFileW = NewBoundProc(Kernel32, "ReplaceFileW", CheckBool)
+)
+
+// Add this to your wincoe bindings / main_api.go
+const (
+	REPLACEFILE_WRITE_THROUGH       = 0x00000001
+	REPLACEFILE_IGNORE_MERGE_ERRORS = 0x00000002
+	REPLACEFILE_IGNORE_ACL_ERRORS   = 0x00000004
+)
+
+// ReplaceFile atomically replaces 'replaced' with 'replacement', creating an optional backup.
+func ReplaceFile(replaced, replacement, backup string, flags uint32) error {
+	replacedPtr, err := windows.UTF16PtrFromString(replaced)
+	if err != nil {
+		return fmt.Errorf("convert replaced path %q to UTF-16: %w", replaced, err)
+	}
+	replacementPtr, err := windows.UTF16PtrFromString(replacement)
+	if err != nil {
+		return fmt.Errorf("convert replacement path %q to UTF-16: %w", replacement, err)
+	}
+
+	var backupPtr *uint16
+	if backup != "" {
+		backupPtr, err = windows.UTF16PtrFromString(backup)
+		if err != nil {
+			return fmt.Errorf("convert backup path %q to UTF-16: %w", backup, err)
+		}
+	}
+
+	// Utilizing your existing //go:uintptrescapes architecture
+	res1 := procReplaceFileW.Call(
+		uintptr(unsafe.Pointer(replacedPtr)),
+		uintptr(unsafe.Pointer(replacementPtr)),
+		uintptr(unsafe.Pointer(backupPtr)),
+		uintptr(flags),
+		0,
+		0,
+	)
+	return res1.Err
+}
+
+// FileWriter is the persistence contract.
+// Extracted from Server so saves can be intercepted in tests without
+// touching the filesystem, and so fileWriteMu is an implementation detail
+// rather than a Server concern.
+type FileWriter interface {
+	SafeWriteFile(filename string, data []byte, perm os.FileMode) error
+	CheckPowerLossFile(filename string)
+	SetExtraSafety(enabled bool)
+	SetRetryParams(maxRetries, retryBackoffMs int)
+}
+
+// GenericSafeFileWriter is the production FileWriter.
+// It serialises all writes through its own mutex (replacing Server.fileWriteMu)
+// and conditionally uses a staging file when cfg.ExtraSafety is true.
+// cfg is a pointer to Server.config so ExtraSafety is always read at call time.
+type GenericSafeFileWriter struct {
+	mu             sync.Mutex
+	extraSafety    bool
+	maxRetries     int
+	retryBackoffMs int
+	liveLogger     *atomic.Pointer[slog.Logger]
+}
+
+func NewGenericSafeFileWriter(extraSafety bool, maxRetries, retryBackoffMs int, liveLogger *atomic.Pointer[slog.Logger]) FileWriter {
+	return &GenericSafeFileWriter{
+		extraSafety:    extraSafety,
+		maxRetries:     maxRetries,
+		retryBackoffMs: retryBackoffMs,
+		liveLogger:     liveLogger,
+	}
+}
+
+func (fw *GenericSafeFileWriter) getLogger() *slog.Logger {
+	return GetLoggerOrFallback(fw.liveLogger, "GenericSafeFileWriter.liveLogger")
+}
+
+func (fw *GenericSafeFileWriter) SetExtraSafety(enabled bool) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	fw.extraSafety = enabled
+}
+
+// CheckPowerLossFile implements FileWriter.
+// Panics if a non-empty staging file exists for filename, signalling a
+// mid-write crash on a previous run.
+// old:
+// checkPowerLossFile inspects the file system for a lingering commit file.
+// If found, it halts execution to prevent the application from overwriting
+// or loading potentially corrupted state.
+func (fw *GenericSafeFileWriter) CheckPowerLossFile(filename string) {
+	if filename == "" {
+		return
+	}
+	log := fw.getLogger()
+
+	tmpName := filename + PowerlossFileExtension
+	fi, err := OsStatFunc(tmpName)
+	if err != nil {
+		// File doesn't exist (or is completely inaccessible), safe to proceed
+		return
+	}
+	// -> THE FIX: If the file is 0 bytes, cleanup failed on a previous successful run.
+
+	if fi.Size() == 0 {
+		log.Warn("ExtraSafety: Found an empty power-loss staging file. Previous write succeeded, "+
+			"but the temporary file could not be deleted (likely due to directory permissions).",
+			slog.String("tempfilename", tmpName))
+		return
+	}
+	logmsg := fmt.Sprintf(
+		"\n========================================================================\n"+
+			"CRITICAL SAFETY PANIC: Power loss or crash detected!\n"+
+			"The safety file %q exists and contains uncommitted data (%d bytes).\n\n"+
+			"This indicates the server aborted mid-write while updating %q.\n"+
+			"The main file may be corrupted, truncated, or empty (0 bytes).\n\n"+
+			"ACTION REQUIRED:\n"+
+			"1. Manually inspect both files.\n"+
+			"2. The %s file contains your last valid saved data.\n"+
+			"3. Restore the data to the main file, then DELETE the %s file.\n"+
+			"========================================================================\n",
+		tmpName, fi.Size(), filename,
+		PowerlossFileExtension, PowerlossFileExtension,
+	)
+	log.Error(logmsg)
+	panic(logmsg) //FIXME: ? the errors/args are embedded in the msg
+}
+
+// SafeWriteFile implements FileWriter.
+// All writes are serialised through fw.mu (replacing the old Server.fileWriteMu).
+// When cfg.ExtraSafety is true, data is first written to a staging file
+// (filename + ".powergotlost") so a power-loss mid-write is detectable on
+// the next boot via CheckPowerLossFile.
+// old:
+// SafeWriteFile attempts a crash-safe file update without using os.Rename,
+// preserving Windows ACLs and falling back gracefully if directory permissions
+// block the creation of temporary files.
+//
+// By writing the complete payload to [filename].powergotlost first, flushing it to hardware, and only then truncating the target file, you create a cryptographic-like commit phase.
+func (fw *GenericSafeFileWriter) SafeWriteFile(filename string, data []byte, perm os.FileMode) error {
+	log := fw.getLogger()
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+
+	// Capture these parameters immediately AFTER taking the lock
+	maxAttempts := 1 + fw.maxRetries
+	backoffDuration := time.Duration(fw.retryBackoffMs) * time.Millisecond
+
+	if fw.extraSafety {
+		tmpName := filename + PowerlossFileExtension
+
+		// 1. Declare the granular error variables outside the closure
+		var createErr, writeErr, syncErr, closeErr error
+
+		// step1. Try to write to a temp file first to ensure disk space and data integrity.
+		// 2. Wrap the entire atomic file operation in the retry loop
+		stagingErr := RetryFileOp(maxAttempts, backoffDuration, func() error {
+			// Reset errors on each try so they accurately reflect the *final* attempt
+			createErr, writeErr, syncErr, closeErr = nil, nil, nil, nil
+
+			var tmpFile *os.File
+			tmpFile, createErr = os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+			if createErr != nil {
+				return fmt.Errorf("create failed: %w", createErr)
+			}
+
+			_, writeErr = tmpFile.Write(data)
+			syncErr = tmpFile.Sync()
+			closeErr = tmpFile.Close()
+
+			// If any of these fail, we return an error to trigger the next retry attempt
+			if writeErr != nil || syncErr != nil || closeErr != nil {
+				return fmt.Errorf("write/sync/close failed (write=%w sync=%w close=%w)", writeErr, syncErr, closeErr)
+			}
+			return nil
+		})
+
+		if stagingErr == nil {
+			// Temp file is safely on disk. Overwrite the target file directly
+			// so we don't alter its existing Windows permissions/ACLs.
+			//XXX: which means we fallthru here
+			// --- SUCCESS BRANCH ---
+			log.Debug("ExtraSafety: Staged recovery file on disk", slog.String("tempfilename", tmpName))
+			// and after the below fallthru (from step2) then Clean up the temp file
+
+			// Queue cleanup. If we crash/lose power after this point,
+			// this defer never runs, leaving the safe copy intact.
+			defer func() {
+				ondeleteErr := RetryFileOp(maxAttempts, backoffDuration, func() error { return OsRemoveFunc(tmpName) })
+				if ondeleteErr == nil {
+					log.Debug("ExtraSafety: unStaged recovery file from disk", slog.String("tempfilename", tmpName))
+					// Successful deletion, nothing more to do
+					return
+				}
+				//aside: Trying to rename the file as an intermediary step (e.g., trying to rename file.json.powergotlost to file.json.trash) usually fails under the exact same security context as a deletion. In almost all operating systems and file systems (including Windows NTFS), a Rename operation requires delete/modify privileges on the source file to un-link it from its original name. Wiping it to 0 bytes bypasses the directory management layer entirely and works purely on file-level write access, making it the most robust fallback option available.
+				log.Warn("ExtraSafety: failed to delete staging file(possibly due to directory permissions?), attempting truncation fallback",
+					SafeErr(ondeleteErr))
+
+				// Fallback: If we can't delete it, truncate it to 0 bytes.
+				// Since we already have write handle permissions to this file, this is highly likely to succeed.
+				// truncFile, truncErr := os.OpenFile(tmpName, os.O_WRONLY|os.O_TRUNC, perm)
+				if truncErr := RetryFileOp(maxAttempts, backoffDuration, func() error {
+					return TruncateStagingFileToZero(tmpName, perm)
+				}); truncErr == nil {
+					log.Warn("ExtraSafety: successfully truncated staging file to 0 bytes as a fallback preservation step",
+						slog.String("tempfilename", tmpName))
+				} else {
+					// Absolute worst case scenario: Can't delete AND can't write/truncate an open file.
+
+					// CRITICAL ESCALATION: We can't delete it AND we can't truncate it.
+					// The file is stuck on disk with data, making a future boot panic inevitable.
+					// Crash immediately while the administrator is interacting with the system.
+					logmsg := fmt.Sprintf(
+						"\n========================================================================\n"+
+							"CRITICAL SAFETY PANIC: Staging file cleanup failed completely!\n"+
+							"The temporary staging file %q cannot be deleted or truncated.\n\n"+
+							"Delete error: %v\n"+
+							"Truncation error: %v\n\n"+
+							"Because the file contains non-zero bytes, the next server boot will panic.\n"+
+							"Halting execution immediately to prevent corrupted filesystem operation.\n"+
+							"========================================================================\n",
+						tmpName, ondeleteErr, truncErr,
+					)
+					log.Error(logmsg) //FIXME: ? the errors/args are embedded in the msg
+					panic(logmsg)
+				}
+			}()
+			//continue with staging .powerloss file already having been created+sync'd successfully. and the defer to remove it being in place.
+		} else {
+			// --- FAILURE BRANCH ---
+
+			// We check the captured errors from the final retry attempt to determine exactly what to log
+			if createErr != nil {
+				log.Warn("ExtraSafety: Can't create temp staging file before writing the actual file(lacking directory write permissions?), using fallback which means if power-loss occurs in a very tiny window here then the file is lost",
+					SafeErr(createErr),
+					slog.String("filename", filename),
+					slog.String("wanted_tempfilename", tmpName))
+			} else {
+				// FIX FOR THE ELSE BRANCH: The staging write itself failed or was cut short.
+				// Attempt deletion. If deletion fails, force a truncation down to 0 bytes
+				// to neutralize any partial garbage data that would trip up the next boot.
+				ondeleteErr := RetryFileOp(maxAttempts, backoffDuration, func() error { return OsRemoveFunc(tmpName) })
+				log.Warn("ExtraSafety: Failed to fully write or/and sync or/and close staging file",
+					slog.String("tempfilename", tmpName),
+					SafeErr2("writeErr", writeErr),
+					SafeErr2("syncErr", syncErr),
+					SafeErr2("closeErr", closeErr),
+					SafeErr2("ondelete_err", ondeleteErr))
+
+				if ondeleteErr != nil {
+					//failed to delete
+					if truncErr := RetryFileOp(maxAttempts, backoffDuration, func() error {
+						return TruncateStagingFileToZero(tmpName, perm)
+					}); truncErr == nil {
+						log.Warn("ExtraSafety: successfully neutralized staging file to 0 bytes to prevent false-positive reboot panics",
+							slog.String("tempfilename", tmpName),
+							SafeErr2("ondeleteErr", ondeleteErr),
+						)
+						//continue
+					} else {
+						// Worse-case scenario: Write failed, cannot delete, and cannot truncate.
+						// Non-zero junk data is permanently locked on disk. Panic immediately.
+						logmsg := fmt.Sprintf(
+							"\n========================================================================\n"+
+								"CRITICAL SAFETY PANIC: Failed staging write left un-neutralized garbage bytes!\n"+
+								"The temporary staging file %q failed to write, and both deletion and\n"+
+								"truncation attempts failed.\n\n"+
+								"Delete error: %v\n"+
+								"Truncation error: %v\n\n"+
+								"To prevent a false-positive crash recovery panic on the next system boot,\n"+
+								"execution is halted immediately.\n"+
+								"========================================================================\n",
+							tmpName, ondeleteErr, truncErr,
+						)
+						log.Error(logmsg) //FIXME: ? the errors/args are embedded in the msg
+						panic(logmsg)
+					}
+				} else {
+					//delete succeeded
+					log.Debug("ExtraSafety: unStaged recovery file from disk", slog.String("tempfilename", tmpName))
+					//continue
+				}
+			}
+		}
+	} //end 'if' extraSafety
+
+	// 2. Fallback: If we couldn't create the .tmp file (likely folder permissions),
+	// do a direct write but enforce a hardware sync to minimize the corruption window.
+	// step2. Overwrite the target file directly (Retains Windows ACLs)
+	if err := RetryFileOp(maxAttempts, backoffDuration, func() error {
+		return WriteSyncedFile(filename, data, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	}); err == nil {
+		return nil
+	} else {
+		return fmt.Errorf("failed to open/write/sync/close the file %q, err: %w", filename, err /*non-nil here*/)
+	}
+}
+
+// RetryFileOp attempts fn up to maxAttempts times with a short backoff
+// between attempts, to absorb transient Windows file locks (Defender,
+// Search Indexer, backup agents) that typically release within milliseconds.
+// Returns the last error if every attempt fails.
+func RetryFileOp(maxAttempts int, backoff time.Duration, fn func() error) error {
+	if maxAttempts < 1 {
+		panic2("BUG: dev fail: retryFileOp called with maxAttempts < 1")
+	}
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		if lastErr = fn(); lastErr == nil {
+			//succeeded
+			return nil
+		}
+		if i < maxAttempts-1 {
+			time.Sleep(backoff)
+		}
+	}
+	//failed
+	return lastErr
+}
+
+// TruncateStagingFileToZero opens the staging file with O_TRUNC (destroying
+// its contents in-place, no delete/rename required), syncs the 0-byte state
+// to disk, and closes it. This is the fallback path when the staging file
+// can't be deleted outright but must not be left containing non-zero bytes,
+// since CheckPowerLossFile treats any non-empty staging file as evidence of
+// a crash mid-write on the next boot.
+func TruncateStagingFileToZero(tmpName string, perm os.FileMode) error {
+	truncFile, openErr := os.OpenFile(tmpName, os.O_WRONLY|os.O_TRUNC, perm)
+	if openErr != nil {
+		return fmt.Errorf("open for truncate failed: %w", openErr)
+	}
+
+	syncErr := truncFile.Sync() // Ensure the 0-byte state hits disk
+	closeErr := truncFile.Close()
+
+	if syncErr != nil && closeErr != nil {
+		return fmt.Errorf("sync after truncate failed: %w (close also failed: %w)", syncErr, closeErr)
+	}
+	if syncErr != nil {
+		return fmt.Errorf("sync after truncate failed: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close after truncate+sync failed: %w", closeErr)
+	}
+
+	return nil
+}
+
+// WriteSyncedFile opens filename with the given flags, writes data, syncs,
+// and closes as a single retryable unit. A mid-write failure from a
+// transient Windows file lock is exactly as retryable as an open failure,
+// so this covers both together rather than only guarding OpenFile.
+func WriteSyncedFile(filename string, data []byte, flags int, perm os.FileMode) error {
+	f, err := os.OpenFile(filename, flags, perm)
+	if err != nil {
+		return fmt.Errorf("open failed: %w", err)
+	}
+	n, writeErr := f.Write(data)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+
+	if writeErr != nil {
+		return fmt.Errorf("write failed after %d/%d bytes: %w", n, len(data), writeErr)
+	}
+	if syncErr != nil {
+		return fmt.Errorf("sync failed: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close failed: %w", closeErr)
+	}
+	return nil
+}
+
+// SafeErr converts an error to a primitive string attribute safely.
+// If the error is nil, it gracefully logs it as "<nil>" without panicking.
+func SafeErr(err error) slog.Attr {
+	return SafeErr2("err", err)
+}
+
+// SafeErr2 converts an error to a primitive string attribute safely.
+// If the error is nil, it gracefully logs it as "<nil>" without panicking.
+func SafeErr2(msg string, err error) slog.Attr {
+	if err == nil {
+		return slog.String(msg, "<nil>")
+	}
+	return slog.String(msg, err.Error())
+}
+
+// PowerlossFileExtension any saved file with this extension means power-loss (or panic in code?) occurred in a very tiny window and thus this is your potentially safe config and should be manually investigated for restoration purposes esp. if the main file is 0 bytes.
+const PowerlossFileExtension string = ".powergotlost"
+const BackupFileExtension string = ".bak"
+
+// win11SafeFileWriter is the production FileWriter for Windows.
+// It serialises all writes through its own mutex and always attempts a
+// transactional swap via ReplaceFileW to gain atomic updates and automated backups.
+// If the Win32 transaction is blocked by directory/file permissions or ACL limits,
+// it gracefully falls back to an in-place truncate write.
+type win11SafeFileWriter struct {
+	mu             sync.Mutex
+	extraSafety    bool // Kept for interface alignment; always runs staging on Windows
+	maxRetries     int
+	retryBackoffMs int
+	liveLogger     *atomic.Pointer[slog.Logger]
+}
+
+func NewWin11SafeFileWriter(extraSafety bool, maxRetries, retryBackoffMs int, liveLogger *atomic.Pointer[slog.Logger]) FileWriter {
+	return &win11SafeFileWriter{
+		extraSafety:    extraSafety,
+		maxRetries:     maxRetries,
+		retryBackoffMs: retryBackoffMs,
+		liveLogger:     liveLogger,
+	}
+}
+
+func (fw *win11SafeFileWriter) getLogger() *slog.Logger {
+	return GetLoggerOrFallback(fw.liveLogger, "win11SafeFileWriter.liveLogger")
+}
+
+func (fw *win11SafeFileWriter) SetExtraSafety(enabled bool) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	fw.extraSafety = enabled
+}
+
+// CheckPowerLossFile implements FileWriter.
+// Inspects the filesystem for a lingering, non-empty staging file. If detected,
+// it means a prior run crashed mid-transaction, and it halts to protect system state.
+func (fw *win11SafeFileWriter) CheckPowerLossFile(filename string) {
+	if filename == "" {
+		return
+	}
+	log := fw.getLogger()
+
+	tmpName := filename + PowerlossFileExtension
+	fi, err := OsStatFunc(tmpName)
+	if err != nil {
+		// File doesn't exist or is completely inaccessible, safe to proceed
+		return
+	}
+
+	// If the file is 0 bytes, a previous cleanup attempt dropped to truncation but
+	// couldn't erase the file record. This is safe to bypass.
+	if fi.Size() == 0 {
+		log.Warn("Windows FileWriter: Found an empty power-loss staging file. Previous write succeeded, but the temporary file record could not be unlinked.",
+			slog.String("tempfilename", tmpName))
+		return
+	}
+
+	logmsg := fmt.Sprintf(
+		"\n========================================================================\n"+
+			"CRITICAL SAFETY PANIC: Power loss or crash detected!\n"+
+			"The safety file %q exists and contains uncommitted data (%d bytes).\n\n"+
+			"This indicates the server aborted mid-write while updating %q.\n"+
+			"The main file may be corrupted, truncated, or empty (0 bytes).\n\n"+
+			"ACTION REQUIRED:\n"+
+			"1. Manually inspect both files.\n"+
+			"2. The %s file contains your last valid saved data.\n"+
+			"3. Restore the data to the main file, then DELETE the %s file.\n"+
+			"========================================================================\n",
+		tmpName, fi.Size(), filename,
+		PowerlossFileExtension, PowerlossFileExtension,
+	)
+	log.Error(logmsg)
+	panic(logmsg)
+}
+
+// SafeWriteFile implements FileWriter.
+// Always attempts to write a staging file and run an atomic ReplaceFileW swap.
+// If ReplaceFileW aborts (e.g. because it cannot copy the original file's ACLs
+// due to lacking WRITE_DAC permissions), the staging file is erased and the write
+// falls back to a direct in-place truncation, preserving target security configurations.
+func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm os.FileMode) error {
+	log := fw.getLogger()
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+
+	// Capture these parameters immediately AFTER taking the lock
+	maxAttempts := 1 + fw.maxRetries
+	backoffDuration := time.Duration(fw.retryBackoffMs) * time.Millisecond
+
+	tmpName := filename + PowerlossFileExtension
+	backupName := filename + BackupFileExtension
+
+	stagingSuccess := false
+	var createErr, writeErr, syncErr, closeErr error
+
+	// Step 1: Always try to write and flush the staging payload to disk first
+	stagingErr := RetryFileOp(maxAttempts, backoffDuration, func() error {
+		createErr, writeErr, syncErr, closeErr = nil, nil, nil, nil
+
+		var tmpFile *os.File
+		tmpFile, createErr = os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+		if createErr != nil {
+			return fmt.Errorf("create failed: %w", createErr)
+		}
+
+		_, writeErr = tmpFile.Write(data)
+		syncErr = tmpFile.Sync()
+		closeErr = tmpFile.Close()
+
+		if writeErr != nil || syncErr != nil || closeErr != nil {
+			return fmt.Errorf("write/sync/close failed (write=%w sync=%w close=%w)", writeErr, syncErr, closeErr)
+		}
+		return nil
+	})
+
+	if stagingErr == nil {
+		log.Debug("Windows FileWriter: Staged recovery file written and flushed successfully", slog.String("tempfilename", tmpName))
+		stagingSuccess = true
+	} else {
+		log.Warn("Windows FileWriter: Directory ACLs or disk issues blocked staging file creation; skipping to in-place fallback", SafeErr(stagingErr))
+	}
+
+	// Step 2: Attempt native atomic Win32 transaction
+	if stagingSuccess {
+		// ReplaceFileW requires the target destination to exist. If this is a first-boot
+		// scenario and the target is missing, we bypass ReplaceFileW and perform a clean rename.
+		if _, statErr := OsStatFunc(filename); os.IsNotExist(statErr) {
+			log.Info("Windows FileWriter: Destination file does not exist, committing via initial rename", slog.String("path", filename))
+			renameErr := OsRenameFunc(tmpName, filename)
+			if renameErr == nil {
+				return nil // Done with first-boot save
+			}
+			log.Warn("Windows FileWriter: Staging file rename failed; clearing and using truncate fallback", SafeErr(renameErr))
+			removeErr := OsRemoveFunc(tmpName)
+			if removeErr != nil {
+				log.Warn("Windows FileWriter: Failed to delete staging file after failed rename; attempting neutralization truncation", SafeErr(removeErr))
+				if truncErr := RetryFileOp(maxAttempts, backoffDuration, func() error {
+					return TruncateStagingFileToZero(tmpName, perm)
+				}); truncErr != nil {
+					logmsg := fmt.Sprintf(
+						"\n========================================================================\n"+
+							"CRITICAL SAFETY PANIC: Staging file rename failed and cleanup failed completely!\n"+
+							"The temporary staging file %q cannot be deleted or truncated.\n\n"+
+							"Delete error: %v\n"+
+							"Truncation error: %v\n\n"+
+							"Because the file contains non-zero bytes, the next server boot will panic.\n"+
+							"Halting execution immediately to prevent corrupted filesystem operation.\n"+
+							"========================================================================\n",
+						tmpName, removeErr, truncErr,
+					)
+					log.Error(logmsg)
+					panic(logmsg)
+				} else {
+					log.Warn("Windows FileWriter: Successfully truncated staging file to 0 bytes after failed rename", slog.String("tempfilename", tmpName))
+				}
+			}
+		} else {
+			// We intentionally omit REPLACEFILE_IGNORE_ACL_ERRORS. If Windows can't
+			// guarantee full ACL preservation, we WANT ReplaceFileW to fail so that
+			// we drop down to truncation instead of altering file permissions.
+			flags := uint32(REPLACEFILE_IGNORE_MERGE_ERRORS)
+
+			replaceErr := ReplaceFileFunc(filename, tmpName, backupName, flags)
+			if replaceErr == nil {
+				// Win32 documentation states the replacement staging file is automatically unlinked.
+				// Run a defensive validation check to guarantee it was eliminated.
+				if _, statErr := OsStatFunc(tmpName); statErr == nil {
+					log.Error("BUG: ReplaceFileW reported success but staging file still exists on disk(tho it's possible something else created it this fast). Force removing.", slog.String("filename", tmpName))
+					removeErr := OsRemoveFunc(tmpName)
+					if removeErr != nil {
+						log.Error("BUG: failed to remove the staging file that somehow ReplaceFileW still left on disk just now. Continuing anyway.", SafeErr(removeErr), slog.String("filename", tmpName))
+					}
+				} //else it correctly doesn't exist
+				log.Debug("Windows FileWriter: file backed up and replaced atomically",
+					slog.String("existing_file", filename),
+					slog.String("backup_file", backupName),
+				)
+				return nil // Success! Transaction fully committed and rolled to .bak
+			}
+
+			// ReplaceFileW transaction wholly aborted (e.g., locked backup file, or no WRITE_DAC right)
+			log.Warn("Windows FileWriter: ReplaceFileW transaction aborted; clearing staging file and falling back", SafeErr(replaceErr))
+
+			// Resilience cleanup: neutralize the abandoned staging file right now so it doesn't cause a false reboot panic
+			ondeleteErr := RetryFileOp(maxAttempts, backoffDuration, func() error { return OsRemoveFunc(tmpName) })
+			if ondeleteErr != nil {
+				log.Warn("Windows FileWriter: Failed to delete staging file after transaction failure; attempting neutralization truncation", SafeErr(ondeleteErr))
+
+				if truncErr := RetryFileOp(maxAttempts, backoffDuration, func() error {
+					return TruncateStagingFileToZero(tmpName, perm)
+				}); truncErr != nil {
+					// Catastrophic edge case: write failed, replace failed, file cannot be deleted or zeroed out.
+					// Junk data remains locked on disk, making a future boot panic inevitable.
+					logmsg := fmt.Sprintf(
+						"\n========================================================================\n"+
+							"CRITICAL SAFETY PANIC: ReplaceFileW failed and staging file cannot be neutralized!\n"+
+							"The temporary staging file %q holds unmanaged garbage bytes.\n\n"+
+							"Delete error: %v\n"+
+							"Truncation error: %v\n\n"+
+							"Halting execution immediately to block an inevitable false-positive boot recovery panic.\n"+
+							"========================================================================\n",
+						tmpName, ondeleteErr, truncErr,
+					)
+					log.Error(logmsg)
+					panic(logmsg)
+				} else {
+					log.Warn("Windows FileWriter: Successfully truncated staging file to 0 bytes", slog.String("tempfilename", tmpName))
+				}
+			}
+		}
+	}
+
+	// Step 3: FALLBACK PHASE — In-place Truncation Write
+	// Truncating modifies file blocks directly on the underlying MFT record.
+	// This ensures the file's original explicit ACL security context is completely untouched.
+	log.Info("Windows FileWriter: Executing in-place truncation fallback write to preserve existing file ACLs", slog.String("path", filename))
+
+	if err := RetryFileOp(maxAttempts, backoffDuration, func() error {
+		return WriteSyncedFile(filename, data, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	}); err == nil {
+		return nil
+	} else {
+		return fmt.Errorf("windows safe file writer completely failed: fallback open/write/sync/close on %q failed: %w", filename, err)
+	}
+}
+
+func (fw *GenericSafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	fw.maxRetries = maxRetries
+	fw.retryBackoffMs = retryBackoffMs
+}
+
+func (fw *win11SafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	fw.maxRetries = maxRetries
+	fw.retryBackoffMs = retryBackoffMs
+}
+
+// Hooks for testing. In production, these point to the standard OS/wincoe functions.
+var (
+	OsStatFunc      = os.Stat
+	OsRenameFunc    = os.Rename
+	OsRemoveFunc    = os.Remove
+	ReplaceFileFunc = ReplaceFile
+)
