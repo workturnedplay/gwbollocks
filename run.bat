@@ -1,4 +1,6 @@
 @echo off
+rem 1. Prevent the current working directory from taking precedence over PATH, doesn't work with eg. "start go.exe"
+set "NoDefaultCurrentDirectoryInExePath=1"
 
 :: (nope:)disallow Ctrl+break, no effect, it still prompts: Terminate batch job (Y/N)?
 ::break off

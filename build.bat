@@ -1,7 +1,12 @@
 @echo off
+rem 1. Prevent the current working directory from taking precedence over PATH, doesn't work with eg. "start go.exe"
+set "NoDefaultCurrentDirectoryInExePath=1"
+::if running as admin must get back to current dir:
+cd /d %~dp0
+
 setlocal enabledelayedexpansion
 
-echo TODO: this(no console output variant) isn't implemented yet.
+echo TODO: this(no console output variant) isn't implemented yet. Until then(if ever) use .\devbuild.bat
 ::Continue or Ctrl+C to exit.
 pause
 exit 1
@@ -31,8 +36,7 @@ if "!HAS_WORKSPACE!"=="1" (
   echo Running vendored due to lack of workspace
 )
 
-::if running as admin must get back to current dir:
-cd /d "%~dp0"
+
 
 echo Running go vet...
 :: ./... means “Walk the directory tree from here, find every Go package, and apply vet to each.”
