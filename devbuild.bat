@@ -46,7 +46,7 @@ echo Running go vet...
 :: Including dead branches
 :: Including code not exercised by tests
 ::go vet -mod=vendor ./...
-go vet !MOD_FLAG! -unsafeptr=false
+go vet !MOD_FLAG! -unsafeptr=true
 if errorlevel 1 goto :fail
 
 go build !BUILD_WITH_RACE_DETECTOR! !MOD_FLAG! .
