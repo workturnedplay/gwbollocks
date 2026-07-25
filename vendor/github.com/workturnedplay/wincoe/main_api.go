@@ -608,6 +608,7 @@ type WinResult struct {
 	// Raw status returned by LazyProc.Call. Usually ERROR_SUCCESS
 	// on successful calls, but some Win32 APIs use it to report
 	// additional success information (e.g. ERROR_ALREADY_EXISTS).
+	//this is actually the GetLastError() done atomically(ie. unpreemptible) by Go/asm right after the windows syscall returned
 	CallStatus error
 
 	Err error // normalized according to the Check*() function that NewBoundProc() got as the last arg!
@@ -647,6 +648,13 @@ func (r WinResult) CallStatusIs(target error) bool {
 	return errors.Is(r.CallStatus, target)
 }
 
+// Static assertion: CheckWinResult's r1-recovery path (treating a non-zero
+// r1 as an errno when callErr is unavailable) assumes ERROR_SUCCESS == 0,
+// since it only takes that path when r1 != 0. If ERROR_SUCCESS were ever
+// redefined to something else, this fails to compile instead of silently
+// letting CheckWinResult misclassify a success code as a failure.
+var _ = [0 - int(windows.ERROR_SUCCESS)]byte{}
+
 // CheckWinResult processes a Windows API result.
 //
 // It returns nil on success (when isFailure is false).
@@ -684,6 +692,8 @@ func CheckWinResult(
 		// Only treat r1 as an errno if it's non-zero.
 		if r1 != 0 { // 0 here is exactly windows.ERROR_SUCCESS
 			errno := windows.Errno(r1) //doneTODO: see how we can match against this, I doubt errors.Is still works for this! actually, it seems to, based on the below!
+
+			//I keep the redundancy of these 2 compile-time asserts(type and var) here, on purpose(and the package level one before this function there as well):
 
 			// Local compile-time assertion trap(to avoid that inner 'if'):
 			type _ [0 - int(windows.ERROR_SUCCESS)]byte
@@ -882,6 +892,7 @@ func WinCall(proc LazyProcish, check WinCheckFunc, args ...uintptr) WinResult {
 	}
 	// args is a []uintptr, but because of //go:uintptrescapes, the caller
 	// has already pinned the memory safely before we get here.
+	//"Go's proc.Call() always atomcially captures LastError immediately after the C code finishes." as 3rd arg aka CallStatus(should rename to lastError ?! or not it's more confusing!)
 	r1, r2, callStatus := proc.Call(args...)
 	//XXX: don't put anything here, which might call a syscall or it might delete the last error for a potential future GetLastError() call.
 	return WinResult{
@@ -983,20 +994,54 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 			!errors.Is(err, windows.ERROR_MORE_DATA) {
 			return nil, err //TODO: shouldn't we wrap this err here? surely caller is using errors.Is on it no?! and if we don't wrap it, it's not clear it passed thru callWithRetry itself!
 		}
+		// 	// Loop continues, using the updated 'size' from the failed call
+		// 	//however:
+		// 	// If size didn't increase but we still got an error,
+		// 	// we should nudge it upward to prevent an infinite loop.
+		// 	// We use uint64 casts to satisfy gosec G115.
+		// 	// 1. Convert both to uint64 to compare safely without narrowing (Fixes G115)
+		// 	if uint64(size) <= uint64(len(buf)) {
+		// 		// 2. Check for overflow before adding 1024
+		// 		const increment = 1024
+		// 		const MaxInt = math.MaxUint32
+		// 		if MaxInt-size < increment {
+		// 			return nil, fmt.Errorf("%s:callWithRetry: buffer size(%d) would overflow uint32(%d) if adding %d", who, size, MaxInt, increment)
+		// 		}
+		// 		size += increment
+		// 	}
+
 		// Loop continues, using the updated 'size' from the failed call
 		//however:
-		// If size didn't increase but we still got an error,
-		// we should nudge it upward to prevent an infinite loop.
-		// We use uint64 casts to satisfy gosec G115.
-		// 1. Convert both to uint64 to compare safely without narrowing (Fixes G115)
+		// If size (the API's own newly-reported value) isn't meaningfully
+		// bigger than what we JUST tried, we should nudge it upward
+		// ourselves to prevent an infinite loop. We grow relative to our own
+		// last-attempted buffer (len(buf)), NOT relative to 'size' itself:
+		// for paginated/resumable enumeration APIs (e.g. EnumServicesStatusEx,
+		// used by GetServiceNamesFromPIDUncached), the documented "bytes
+		// needed" value means "bytes needed for the REMAINING entries only"
+		// once some entries already fit in a partially-successful call, not
+		// "total bytes needed from scratch" -- and because every retry here
+		// restarts enumeration fresh (GetServiceNamesFromPIDUncached resets
+		// its resume handle to 0 on every attempt), a fresh retry genuinely
+		// needs the FULL total again. Trusting a possibly-"remaining-only"
+		// value directly could undersize the next buffer and repeat the
+		// same partial-fill/ERROR_MORE_DATA cycle. Doubling our own last
+		// size (matching QueryFullProcessName's identical growth strategy)
+		// sidesteps that ambiguity entirely and also reaches multi-megabyte
+		// sizes within only a handful of retries for a heavily loaded table,
+		// instead of a flat +1KB per retry potentially exhausting all
+		// MAX_RETRIES attempts while still coming up short.
+		// We use uint64 casts throughout to satisfy gosec G115.
 		if uint64(size) <= uint64(len(buf)) {
-			// 2. Check for overflow before adding 1024
-			const increment = 1024
-			const MaxInt = math.MaxUint32
-			if MaxInt-size < increment {
-				return nil, fmt.Errorf("%s:callWithRetry: buffer size(%d) would overflow uint32(%d) if adding %d", who, size, MaxInt, increment)
+			const minIncrement uint64 = 1024 // floor, in case len(buf) is currently 0 or tiny
+			next := uint64(len(buf)) * 2
+			if grown := uint64(len(buf)) + minIncrement; next < grown {
+				next = grown
 			}
-			size += increment
+			if next > math.MaxUint32 {
+				return nil, fmt.Errorf("%s:callWithRetry: buffer size(%d) would overflow uint32(%d) if grown to %d", who, len(buf), uint32(math.MaxUint32), next)
+			}
+			size = uint32(next)
 		}
 	}
 	return nil, fmt.Errorf("%s:callWithRetry: buffer growth exceeded max retries(%d)", who, MAX_RETRIES)
@@ -1087,7 +1132,7 @@ func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 func QueryFullProcessName(pid uint32) (string, error) {
 	hProc, err0 := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err0 != nil {
-		return "", fmt.Errorf("OpenProcess failedfor PID %d: %w", pid, err0)
+		return "", fmt.Errorf("OpenProcess failed for PID %d: %w", pid, err0)
 	}
 	//defer windows.CloseHandle(hProc)
 	defer closeHandleLogged(hProc, "QueryFullProcessName:OpenProcess hProc")
@@ -1155,9 +1200,25 @@ func impossibiru(msg string) {
 	msg2 := fmt.Sprintf("Impossible: '%s'", msg)
 	panic2(msg2)
 }
-func panic2(msg string) {
-	GetBugLogger().Error(msg)
+
+// logCriticalThenPanic logs msg through log (which may be asynchronous/
+// buffered -- e.g. bridged into a caller's own async log pipeline, as
+// winbollocks does via initWincoeLogging) AND, defensively, writes the
+// exact same message directly and synchronously to os.Stderr before
+// panicking. This guarantees the diagnostic explaining WHY the process is
+// about to crash is never solely dependent on some caller's async logger
+// successfully draining its buffer before the panic unwinds: since wincoe
+// is a general-purpose library, a panic originating here could just as
+// easily be on a goroutine with no relevant defer/recover chain at all, in
+// which case an async logger's buffered message could be lost forever when
+// the process dies almost immediately afterward.
+func logCriticalThenPanic(log *slog.Logger, msg string) {
+	log.Error(msg)
+	fmt.Fprintf(os.Stderr, "%s\n", msg) //nolint:errcheck // best-effort; we're about to panic regardless
 	panic(msg)
+}
+func panic2(msg string) {
+	logCriticalThenPanic(GetBugLogger(), msg)
 }
 
 // bugLogger is a package-level fallback logger used only by free functions
@@ -1878,7 +1939,15 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 	serviceCacheMu.Unlock()
 
 	// Slow path: coalesce concurrent cache misses for this PID into a
-	// single SCM enumeration.
+	// single SCM enumeration. Note there's a narrow, benign window right
+	// here between the unlock above and the lock below: another goroutine
+	// could finish an in-flight lookup and populate the cache in that exact
+	// gap, in which case we'll redundantly join or start a lookup instead of
+	// noticing the fresh cache entry. This is the same class of accepted
+	// tradeoff already documented at the end of this function (the
+	// delete-then-close(inFlight.done) race on the failure path) -- rare,
+	// benign, and categorically better than adding a lock that spans both
+	// maps just to close it.
 	serviceInFlightMu.Lock()
 	if inFlight, ok := serviceInFlight[targetPID]; ok {
 		// Someone else is already fetching this PID; wait for their result
@@ -2140,8 +2209,8 @@ func (fw *GenericSafeFileWriter) CheckPowerLossFile(filename string) {
 		tmpName, fi.Size(), filename,
 		PowerlossFileExtension, PowerlossFileExtension,
 	)
-	log.Error(logmsg) //FIXME: ? the errors/args are embedded in the msg
-	panic(logmsg)
+	logCriticalThenPanic(log, logmsg) //FIXME: ? the errors/args are embedded in the msg
+	panic(nil)
 }
 
 // SafeWriteFile attempts a crash-safe file update without using os.Rename,
@@ -2394,8 +2463,8 @@ func (fw *win11SafeFileWriter) CheckPowerLossFile(filename string) {
 		tmpName, fi.Size(), filename,
 		PowerlossFileExtension, PowerlossFileExtension,
 	)
-	log.Error(logmsg)
-	panic(logmsg)
+	logCriticalThenPanic(log, logmsg)
+	panic(nil)
 }
 
 // SafeWriteFile implements FileWriter.
@@ -2693,6 +2762,15 @@ func neutralizeOrPanic(tmpName string, perm os.FileMode, maxAttempts int, backof
 			"========================================================================\n",
 		title, tmpName, actionErr, ondeleteErr, truncErr, extraPanicMsg,
 	)
-	log.Error(logmsg)
-	panic(logmsg)
+	logCriticalThenPanic(log, logmsg)
+	panic(nil)
+}
+
+// GetLastError wraps windows.GetLastError.
+//
+// Deprecated: Do not call this. Go erases thread-local error state prior to
+// syscall execution. Always read the 3rd return value (err) from proc.Call().
+// don't use, see: https://github.com/golang/go/issues/41220
+func GetLastError() error {
+	return windows.GetLastError() //nolint:wrapcheck //on-purpose wrapper over this!
 }
