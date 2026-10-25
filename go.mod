@@ -3,7 +3,7 @@ module github.com/workturnedplay/gwbollocks
 go 1.26.2
 
 require (
-	github.com/workturnedplay/wincoe v0.10.14
+	github.com/workturnedplay/wincoe v0.11.1
 	golang.org/x/sys v0.49.0
 )
 
