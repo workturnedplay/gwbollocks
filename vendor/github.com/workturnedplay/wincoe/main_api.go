@@ -28,6 +28,7 @@
 package wincoe
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -2959,49 +2960,23 @@ func (fw *GenericSafeFileWriter) SafeWriteFile(filename string, data []byte, per
 	unlockFile := lockFileForWrite(filename)
 	defer unlockFile()
 
-	if extraSafety {
-		tmpName := filename + PowerlossFileExtension
+	tmpName := filename + PowerlossFileExtension
+	// If we crash/lose power after the staging copy is on disk, it is simply
+	// left behind and CheckPowerLossFile flags it on the next boot.
+	stagingOwned := extraSafety && stageDataOrNeutralize(log, "ExtraSafety", tmpName, data, perm, maxAttempts, backoffDuration)
 
-		// step1. Try to write to a temp file first to ensure disk space and data integrity.
-		stagingErr := writeStagingFileWithRetry(tmpName, data, perm, maxAttempts, backoffDuration)
-
-		if stagingErr == nil {
-			// --- SUCCESS BRANCH ---
-			// Temp file is safely on disk. Overwrite the target file directly
-			// so we don't alter its existing Windows permissions/ACLs.
-			log.Debug("ExtraSafety: Staged recovery file on disk", slog.String("tempfilename", tmpName))
-
-			// Queue cleanup. If we crash/lose power after this point,
-			// this defer never runs, leaving the safe copy intact.
-			defer neutralizeOrPanic(
-				tmpName, perm, maxAttempts, backoffDuration, log, nil,
-				"Staging file cleanup failed completely!",
-				"Because the file contains non-zero bytes, the next server boot will panic.",
-			)
-		} else {
-			// --- FAILURE BRANCH ---
-			log.Warn("ExtraSafety: Can't create temp staging file before writing the actual file (lacking directory write permissions?), using fallback which means if power-loss occurs in a very tiny window here then the file is lost", SafeErr(stagingErr))
-
-			// FIX FOR THE ELSE BRANCH: The staging write itself failed or was cut short.
-			// Attempt deletion or force a truncation down to 0 bytes to neutralize any partial garbage data.
-			neutralizeOrPanic(
-				tmpName, perm, maxAttempts, backoffDuration, log, stagingErr,
-				"Failed staging write left un-neutralized garbage bytes!",
-				"",
-			)
-		}
+	writeErr := writeInPlaceWithRetry(filename, data, perm, maxAttempts, backoffDuration)
+	if stagingOwned {
+		settleStagingAfterInPlaceWrite(log, tmpName, data, perm, maxAttempts, backoffDuration, writeErr, nil,
+			"Staging file cleanup failed completely!",
+			"Because the file contains non-zero bytes, the next server boot will panic.")
 	}
-
-	// 2. Fallback: If we couldn't create the .tmp file (likely folder permissions),
-	// do a direct write but enforce a hardware sync to minimize the corruption window.
-	// step2. Overwrite the target file directly (Retains Windows ACLs)
-	if err := RetryFileOp(maxAttempts, backoffDuration, func() error {
-		return WriteSyncedFile(filename, data, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	}); err == nil {
-		return nil
-	} else {
-		return fmt.Errorf("failed to open/write/sync/close the file %q, err: %w", filename, err)
+	if writeErr != nil {
+		return fmt.Errorf("failed to open/write/sync/close the file %q, err: %w", filename, writeErr)
 	}
+	// The target now holds the newest data: drop a staging copy retained by an earlier failed write.
+	removeSupersededRetainedStaging(log, tmpName, perm, maxAttempts, backoffDuration)
+	return nil
 }
 
 // RetryFileOp attempts fn up to maxAttempts times with a short backoff
@@ -3097,6 +3072,143 @@ func SafeErr2(msg string, err error) slog.Attr {
 // PowerlossFileExtension any saved file with this extension means power-loss (or panic in code?) occurred in a very tiny window and thus this is your potentially safe config and should be manually investigated for restoration purposes esp. if the main file is 0 bytes.
 const PowerlossFileExtension string = ".powergotlost"
 const BackupFileExtension string = ".bak"
+
+// retainedStagingRecord identifies the exact payload of a staging file that THIS
+// process retained after a failed in-place write (see
+// settleStagingAfterInPlaceWrite), so a later successful write can recognise
+// that file as its own, now-superseded leftover and remove it, instead of leaving
+// it to panic the next boot even though the target is fine again.
+type retainedStagingRecord struct {
+	size uint64
+	sum  [sha256.Size]byte
+}
+
+// retainedStagingCopies maps retainedStagingKey(stagingPath) -> retainedStagingRecord.
+// In-memory only: after a restart nothing is tracked, so CheckPowerLossFile
+// still panics on boot for a retained copy, which is the intended behaviour.
+var retainedStagingCopies sync.Map
+
+func retainedStagingKey(tmpName string) string {
+	return strings.ToLower(filepath.Clean(tmpName))
+}
+
+func rememberRetainedStaging(tmpName string, data []byte) {
+	retainedStagingCopies.Store(retainedStagingKey(tmpName), retainedStagingRecord{
+		size: uint64(len(data)),
+		sum:  sha256.Sum256(data),
+	})
+}
+
+func forgetRetainedStaging(tmpName string) {
+	retainedStagingCopies.Delete(retainedStagingKey(tmpName))
+}
+
+func loadRetainedStaging(tmpName string) (retainedStagingRecord, bool) {
+	v, ok := retainedStagingCopies.Load(retainedStagingKey(tmpName))
+	if !ok {
+		return retainedStagingRecord{}, false
+	}
+	rec, typeOK := v.(retainedStagingRecord)
+	if !typeOK {
+		panic2("BUG: retainedStagingCopies contained a non-retainedStagingRecord value")
+	}
+	return rec, true
+}
+
+// stagingFileMatchesRecord reports whether the file at path currently holds
+// exactly the bytes described by rec (same size and SHA-256).
+func stagingFileMatchesRecord(path string, rec retainedStagingRecord) (matches bool, err error) {
+	f, openErr := os.Open(path)
+	if openErr != nil {
+		return false, fmt.Errorf("open %q for verification: %w", path, openErr)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			matches = false
+			err = fmt.Errorf("close %q after verification: %w", path, closeErr)
+		}
+	}()
+
+	fi, statErr := f.Stat()
+	if statErr != nil {
+		return false, fmt.Errorf("stat the opened handle of %q: %w", path, statErr)
+	}
+	size := fi.Size()
+	if !fi.Mode().IsRegular() || size < 0 || uint64(size) != rec.size { //nolint:gosec // G115: size < 0 is checked first
+		return false, nil
+	}
+
+	h := sha256.New()
+	n, copyErr := io.Copy(h, io.LimitReader(f, size+1))
+	if copyErr != nil {
+		return false, fmt.Errorf("hash %q: %w", path, copyErr)
+	}
+	if n != size {
+		return false, nil
+	}
+	var sum [sha256.Size]byte
+	copy(sum[:], h.Sum(nil))
+	return sum == rec.sum, nil
+}
+
+// removeSupersededRetainedStaging runs after an in-place write SUCCEEDED. If this
+// process had retained a staging copy of an earlier, failed write, that copy is
+// now older than the target, so remove it, but only after verifying it is
+// still exactly the plain file we retained. Anything else (tampered, replaced,
+// link, ...) is left untouched and logged. A no-op when nothing is tracked.
+func removeSupersededRetainedStaging(log *slog.Logger, tmpName string, perm os.FileMode, maxAttempts int, backoff time.Duration) {
+	want, tracked := loadRetainedStaging(tmpName)
+	if !tracked {
+		return
+	}
+
+	size, plain, why, statErr := statStagingFileNoFollow(tmpName)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			forgetRetainedStaging(tmpName) // already removed by the operator
+			return
+		}
+		log.Error("Could not inspect the retained staging file; keeping it (it will be re-checked after the next successful write)",
+			slog.String("tempfilename", tmpName), SafeErr(statErr))
+		return
+	}
+	if !plain || size != want.size {
+		log.Error("The staging file is no longer the copy this process retained; leaving it untouched, inspect it manually",
+			slog.String("tempfilename", tmpName), slog.String("reason", why), slog.Uint64("size", size), slog.Uint64("retained_size", want.size))
+		forgetRetainedStaging(tmpName)
+		return
+	}
+
+	matches, verifyErr := stagingFileMatchesRecord(tmpName, want)
+	if verifyErr != nil {
+		log.Error("Could not verify the retained staging file; keeping it (it will be re-checked after the next successful write)",
+			slog.String("tempfilename", tmpName), SafeErr(verifyErr))
+		return
+	}
+	if !matches {
+		log.Error("The staging file content differs from what this process retained; leaving it untouched, inspect it manually",
+			slog.String("tempfilename", tmpName))
+		forgetRetainedStaging(tmpName)
+		return
+	}
+
+	log.Info("A later in-place write succeeded, so removing the staging copy retained by an earlier failed write (it is now older than the target)",
+		slog.String("tempfilename", tmpName))
+	neutralizeOrPanic(
+		tmpName, perm, maxAttempts, backoff, log, nil,
+		"Superseded staging file cleanup failed completely!",
+		"Because the file contains non-zero bytes, the next server boot will panic.",
+	)
+	forgetRetainedStaging(tmpName)
+}
+
+// ErrStagingFileRefused marks a pre-existing staging file (PowerlossFileExtension)
+// that must NOT be reused, truncated or deleted by this process: it holds data,
+// is a link/reparse point/directory, or couldn't be inspected. Such a file is
+// evidence for the operator (see CheckPowerLossFile) and, after a failed
+// in-place write, may hold the only complete copy of the data. Callers must
+// leave it untouched and write the target in place without a new staging copy.
+var ErrStagingFileRefused = errors.New("existing staging file refused and left untouched")
 
 // win11SafeFileWriter is the production FileWriter for Windows.
 // Writes to the SAME file path are serialised via fileWriteLocks; writes to
@@ -3198,20 +3310,17 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 	tmpName := filename + PowerlossFileExtension
 	backupName := filename + BackupFileExtension
 
-	// Step 1: Always try to write and flush the staging payload to disk first
-	stagingErr := writeStagingFileWithRetry(tmpName, data, perm, maxAttempts, backoffDuration)
-	stagingSuccess := stagingErr == nil
+	// Step 1: write and flush the staging payload (or refuse a foreign/non-empty one).
+	stagingOwned := stageDataOrNeutralize(log, "Windows FileWriter", tmpName, data, perm, maxAttempts, backoffDuration)
 
-	if stagingSuccess {
-		log.Debug("Windows FileWriter: Staged recovery file written and flushed successfully", slog.String("tempfilename", tmpName))
-	} else {
-		log.Warn("Windows FileWriter: Directory ACLs or disk issues blocked staging file creation; skipping to in-place fallback", SafeErr(stagingErr))
-	}
-
-	// Step 2: Attempt native atomic Win32 transaction
-	if stagingSuccess {
-		// ReplaceFileW requires the target destination to exist. If this is a first-boot
-		// scenario and the target is missing, we bypass ReplaceFileW and perform a clean rename.
+	// Step 2: atomic Win32 transaction. Success consumes the staging file.
+	// On failure the staging file is NOT neutralized yet: if the in-place
+	// fallback below also fails it is the only complete copy of the data.
+	var transactionErr error
+	var neutralizeTitle string
+	if stagingOwned {
+		// ReplaceFileW requires the target to exist; on a first-boot (missing
+		// target) a clean rename commits instead.
 		if _, statErr := OsStatFunc(filename); errors.Is(statErr, os.ErrNotExist) {
 			log.Info("Windows FileWriter: Destination file does not exist, committing via initial rename", slog.String("path", filename))
 
@@ -3219,24 +3328,18 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 			if renameErr == nil {
 				return nil // Done with first-boot save
 			}
-
-			log.Warn("Windows FileWriter: Staging file rename failed; clearing and using truncate fallback", SafeErr(renameErr))
-			neutralizeOrPanic(
-				tmpName, perm, maxAttempts, backoffDuration, log, renameErr,
-				"Staging file rename failed and cleanup failed completely!",
-				"",
-			)
+			log.Warn("Windows FileWriter: Staging file rename failed; using the truncate fallback", SafeErr(renameErr))
+			transactionErr = renameErr
+			neutralizeTitle = "Staging file rename failed and cleanup failed completely!"
 		} else {
-			// We intentionally omit REPLACEFILE_IGNORE_ACL_ERRORS. If Windows can't
-			// guarantee full ACL preservation, we WANT ReplaceFileW to fail so that
-			// we drop down to truncation instead of altering file permissions.
+			// REPLACEFILE_IGNORE_ACL_ERRORS is intentionally omitted: if Windows can't
+			// guarantee full ACL preservation we WANT failure, then truncation.
 			flags := uint32(REPLACEFILE_IGNORE_MERGE_ERRORS)
 
 			replaceErr := ReplaceFileFunc(filename, tmpName, backupName, flags)
 			if replaceErr == nil {
-				// Win32 documentation states the replacement staging file is automatically unlinked.
-				// Run a defensive validation check to guarantee it was eliminated.
-				if _, statErr := OsStatFunc(tmpName); statErr == nil {
+				// Win32 documents that the replacement file is consumed; verify defensively.
+				if _, statErr2 := OsStatFunc(tmpName); statErr2 == nil {
 					log.Error("BUG: ReplaceFileW reported success but staging file still exists on disk(tho it's possible something else created it this fast). Force removing.", slog.String("filename", tmpName))
 					if removeErr := OsRemoveFunc(tmpName); removeErr != nil {
 						log.Error("BUG: failed to remove the staging file that somehow ReplaceFileW still left on disk just now. Continuing anyway.", SafeErr(removeErr), slog.String("filename", tmpName))
@@ -3246,33 +3349,28 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 					slog.String("existing_file", filename),
 					slog.String("backup_file", backupName),
 				)
-				return nil // Success! Transaction fully committed and rolled to .bak
+				return nil
 			}
-
-			// ReplaceFileW transaction wholly aborted (e.g., locked backup file, or no WRITE_DAC right)
-			log.Warn("Windows FileWriter: ReplaceFileW transaction aborted; clearing staging file and falling back", SafeErr(replaceErr))
-
-			// Resilience cleanup: neutralize the abandoned staging file right now so it doesn't cause a false reboot panic
-			neutralizeOrPanic(
-				tmpName, perm, maxAttempts, backoffDuration, log, replaceErr,
-				"ReplaceFileW failed and staging file cannot be neutralized!",
-				"",
-			)
+			log.Warn("Windows FileWriter: ReplaceFileW transaction aborted; using the truncate fallback", SafeErr(replaceErr))
+			transactionErr = replaceErr
+			neutralizeTitle = "ReplaceFileW failed and staging file cannot be neutralized!"
 		}
 	}
 
-	// Step 3: FALLBACK PHASE — In-place Truncation Write
-	// Truncating modifies file blocks directly on the underlying MFT record.
-	// This ensures the file's original explicit ACL security context is completely untouched.
+	// Step 3: in-place truncation write; modifies file blocks directly, so the
+	// target's explicit ACLs stay untouched.
 	log.Info("Windows FileWriter: Executing in-place truncation fallback write to preserve existing file ACLs", slog.String("path", filename))
-
-	if err := RetryFileOp(maxAttempts, backoffDuration, func() error {
-		return WriteSyncedFile(filename, data, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	}); err == nil {
-		return nil
-	} else {
-		return fmt.Errorf("windows safe file writer completely failed: fallback open/write/sync/close on %q failed: %w", filename, err)
+	writeErr := writeInPlaceWithRetry(filename, data, perm, maxAttempts, backoffDuration)
+	if stagingOwned {
+		// Reaching here with stagingOwned means the transaction did not consume it.
+		settleStagingAfterInPlaceWrite(log, tmpName, data, perm, maxAttempts, backoffDuration, writeErr, transactionErr, neutralizeTitle, "")
 	}
+	if writeErr != nil {
+		return fmt.Errorf("windows safe file writer completely failed: fallback open/write/sync/close on %q failed: %w", filename, writeErr)
+	}
+	// The target now holds the newest data: drop a staging copy retained by an earlier failed write.
+	removeSupersededRetainedStaging(log, tmpName, perm, maxAttempts, backoffDuration)
+	return nil
 }
 
 func (fw *GenericSafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
@@ -3337,21 +3435,114 @@ func CloseHandleLogged(h *windows.Handle, context string) {
 
 // writeStagingFileWithRetry handles the initial attempt to write to a temp file first
 // to ensure disk space and data integrity before touching the main file.
+//
+// A refusal (ErrStagingFileRefused) of a PRE-EXISTING file is permanent: it is
+// returned immediately without retrying. If an earlier attempt of this same call
+// already opened the file, a later refusal can only be that attempt's own partial
+// garbage, so it is reported as an ordinary failure (the caller may then
+// neutralize it).
 func writeStagingFileWithRetry(tmpName string, data []byte, perm os.FileMode, maxAttempts int, backoff time.Duration) error {
-	return RetryFileOp(maxAttempts, backoff, func() error {
-		tmpFile, err := openStagingFileSafely(tmpName, perm)
-		if err != nil {
-			return fmt.Errorf("create failed: %w", err)
+	var (
+		refusal    error
+		openedByUs bool
+	)
+	err := RetryFileOp(maxAttempts, backoff, func() error {
+		tmpFile, openErr := openStagingFileSafely(tmpName, perm)
+		if openErr != nil {
+			if errors.Is(openErr, ErrStagingFileRefused) {
+				if !openedByUs {
+					refusal = openErr
+					return nil // stops RetryFileOp; retrying can't change the verdict
+				}
+				// Deliberately NOT %w: the sentinel must not leak, because this is
+				// our own leftover and the caller has to be allowed to clean it up.
+				return fmt.Errorf("retry could not reuse the staging file %q left behind by an earlier attempt of this same call: %s", tmpName, openErr.Error())
+			}
+			return fmt.Errorf("create failed: %w", openErr)
 		}
+		openedByUs = true
+
 		_, writeErr := tmpFile.Write(data)
 		syncErr := tmpFile.Sync()
+		var truncErr error
+		if writeErr != nil || syncErr != nil {
+			// Best effort: leave an empty file so the next attempt can reclaim it.
+			truncErr = tmpFile.Truncate(0)
+		}
 		closeErr := tmpFile.Close()
 
-		if joined := errors.Join(writeErr, syncErr, closeErr); joined != nil {
+		if joined := errors.Join(writeErr, syncErr, truncErr, closeErr); joined != nil {
 			return fmt.Errorf("write/sync/close of staging file %q failed: %w", tmpName, joined)
 		}
 		return nil
 	})
+	if refusal != nil {
+		return refusal
+	}
+	return err
+}
+
+// stageDataOrNeutralize writes the staging copy and reports whether this call
+// now owns a complete one. On ErrStagingFileRefused it logs and returns false
+// WITHOUT touching the existing file; on any other failure it neutralizes
+// whatever partial garbage this call created.
+func stageDataOrNeutralize(log *slog.Logger, who, tmpName string, data []byte, perm os.FileMode, maxAttempts int, backoff time.Duration) bool {
+	stagingErr := writeStagingFileWithRetry(tmpName, data, perm, maxAttempts, backoff)
+	switch {
+	case stagingErr == nil:
+		// We now own a fresh staging file; any tracking of an older retained one is moot.
+		forgetRetainedStaging(tmpName)
+		log.Debug(who+": staged recovery file written and flushed", slog.String("tempfilename", tmpName))
+		return true
+	case errors.Is(stagingErr, ErrStagingFileRefused):
+		if _, ours := loadRetainedStaging(tmpName); ours {
+			log.Warn(who+": a staging copy retained by an earlier failed in-place write still exists; keeping it untouched "+
+				"(it is the newest complete copy until a write succeeds) and writing in place without a new staging copy. "+
+				"It is removed automatically after a successful in-place write",
+				slog.String("tempfilename", tmpName), SafeErr(stagingErr))
+		} else {
+			log.Error(who+": refusing to touch the pre-existing staging file; writing in place WITHOUT a new staging copy. "+
+				"Inspect it and then delete it (the next boot will panic on it, by design)",
+				slog.String("tempfilename", tmpName), SafeErr(stagingErr))
+		}
+		return false
+	default:
+		log.Warn(who+": can't create the temp staging file before writing the actual file (lacking directory write permissions?), "+
+			"using fallback which means if power-loss occurs in a very tiny window here then the file is lost", SafeErr(stagingErr))
+		neutralizeOrPanic(
+			tmpName, perm, maxAttempts, backoff, log, stagingErr,
+			"Failed staging write left un-neutralized garbage bytes!",
+			"",
+		)
+		return false
+	}
+}
+
+// writeInPlaceWithRetry overwrites filename directly (retains its ACLs).
+func writeInPlaceWithRetry(filename string, data []byte, perm os.FileMode, maxAttempts int, backoff time.Duration) error {
+	return RetryFileOp(maxAttempts, backoff, func() error {
+		return WriteSyncedFile(filename, data, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	})
+}
+
+// settleStagingAfterInPlaceWrite is the ONLY place a staging copy we own may be
+// neutralized after the target write was attempted. If that write failed, the
+// staging file holds the only complete copy of the data: it is retained and
+// recorded, so a later successful write can recognise and remove it (see
+// removeSupersededRetainedStaging), and otherwise the next boot's
+// CheckPowerLossFile flags it. If it succeeded the staging file is obsolete and
+// is neutralized (deleted, else truncated, else panic).
+// data must be exactly what was staged; cause is the earlier failure that
+// forced the in-place path (may be nil).
+func settleStagingAfterInPlaceWrite(log *slog.Logger, tmpName string, data []byte, perm os.FileMode, maxAttempts int, backoff time.Duration, writeErr, cause error, title, extraPanicMsg string) {
+	if writeErr != nil {
+		log.Error("In-place write failed: KEEPING the staging file, it now holds the only complete copy of the data and the target may be truncated/partial",
+			slog.String("tempfilename", tmpName), SafeErr(writeErr))
+		rememberRetainedStaging(tmpName, data)
+		return
+	}
+	neutralizeOrPanic(tmpName, perm, maxAttempts, backoff, log, cause, title, extraPanicMsg)
+	forgetRetainedStaging(tmpName)
 }
 
 // openStagingFileSafely opens (creating if needed) the staging file used for
@@ -3375,75 +3566,60 @@ func openStagingFileSafely(tmpName string, perm os.FileMode) (*os.File, error) {
 		return f, nil
 	}
 	if !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("openStagingFileSafely says that os.OpenFile failed(and not because it doesn't exist) to create %q staging file, with err:%w", tmpName, err) // some other failure (permissions, path issues, etc.) — propagate as-is
+		return nil, fmt.Errorf("openStagingFileSafely says that os.OpenFile failed(and not because it already exists) to create %q staging file, with err:%w", tmpName, err)
 	}
 
-	// 2. Something already exists at tmpName. Inspect it before taking any action.
-	// Only ever safe to reclaim it if it is a plain, empty, regular file with a single hard link.
-
-	// Something already exists at tmpName. Only ever safe to reclaim it if
-	// it is a plain, empty, regular file with a single hard link — exactly
-	// what CheckPowerLossFile's own "empty staging file" tolerance
-	// describes. Refuse anything else outright rather than following it.
+	// 2. Something already exists. Only a plain, empty, single-link regular file
+	// (CheckPowerLossFile's "empty leftover") may be reclaimed; anything else is
+	// refused and must stay untouched (see ErrStagingFileRefused).
 	safe, reason, inspectErr := inspectExistingStagingFile(tmpName)
 	if inspectErr != nil {
-		return nil, fmt.Errorf("staging file %q exists but could not be safely inspected: %w", tmpName, inspectErr)
+		return nil, fmt.Errorf("%w: staging file %q exists but could not be safely inspected: %w", ErrStagingFileRefused, tmpName, inspectErr)
 	}
 	if !safe {
-		return nil, fmt.Errorf("refusing to use staging file %q: %s (possible attack or genuine corruption)", tmpName, reason)
+		return nil, fmt.Errorf("%w: staging file %q: %s (possible attack or genuine corruption)", ErrStagingFileRefused, tmpName, reason)
 	}
 
-	// // Confirmed benign: remove the empty leftover and retry the exclusive
-	// // create so we never write through a pre-existing name.
-	// if rmErr := OsRemoveFunc(tmpName); rmErr != nil {
-	// 	return nil, fmt.Errorf("failed to remove confirmed-benign empty staging file %q before recreating it: %w", tmpName, rmErr)
-	// }
-	// if fil, ofErr := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm); ofErr != nil {
-	// 	return nil, fmt.Errorf("failed to create staging file %q after removed the existing file (so, directory permissions doesn't allow creating new files? and we shoulda just truncated the existing one to keep ACLs?!), err: %w", tmpName, ofErr)
-	// } else {
-	// 	return fil, nil
-	// }
-
-	// 3. Confirmed benign: reuse the existing empty file directly by opening with O_TRUNC.
-	// We DO NOT delete and recreate it (via OsRemoveFunc + O_EXCL) because:
-	//   a) Deleting throws away existing file-level ACLs.
-	//   b) Deleting requires directory-level file creation permissions, which might be restricted.
-	//   c) Re-opening directly avoids an unnecessary delete-recreate window.
-	// 3. Re-assigning 'f' here overwrites a nil pointer, not an open handle.
-	f, err = os.OpenFile(tmpName, os.O_WRONLY|os.O_TRUNC, perm)
+	// 3. Reuse it in place (keeps its ACLs, needs no directory-level permissions).
+	// Deliberately NO O_TRUNC: it was just confirmed empty, so nothing needs
+	// destroying, and if it was swapped for something else in the meantime we
+	// must not truncate that.
+	f, err = os.OpenFile(tmpName, os.O_WRONLY, perm)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open confirmed-benign staging file %q for writing: %w", tmpName, err)
+		return nil, fmt.Errorf("failed to open confirmed-benign empty staging file %q for writing: %w", tmpName, err)
 	}
 
-	// 4. Post-open safety check: verify the handle itself (closing the tiny TOCTOU race window
-	// between inspectExistingStagingFile and os.OpenFile).
-	fi, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("failed to stat open staging file handle %q: %w", tmpName, err)
+	// 4. Re-verify through the handle itself (closes the inspect->open race).
+	fi, statErr := f.Stat()
+	if statErr != nil {
+		return nil, refusalWithClose(f, fmt.Errorf("%w: stat of the opened staging handle %q failed: %w", ErrStagingFileRefused, tmpName, statErr))
 	}
-	if !fi.Mode().IsRegular() {
-		_ = f.Close()
-		return nil, fmt.Errorf("staging file handle %q is not a regular file after open (mode: %v)", tmpName, fi.Mode())
+	if !fi.Mode().IsRegular() || fi.Size() != 0 {
+		return nil, refusalWithClose(f, fmt.Errorf("%w: staging file %q changed between inspection and open (mode: %v, size: %d)", ErrStagingFileRefused, tmpName, fi.Mode(), fi.Size()))
 	}
 
 	return f, nil
 }
 
-// inspectExistingStagingFile opens path WITHOUT following any reparse point
-// (symlink/junction) that might be there, and reports whether it is safe to
-// reclaim as a benign, previously-written-but-not-yet-cleaned-up staging
-// file: specifically, a plain regular file, zero bytes long, with exactly
-// one hard link (itself).
-//
-// FILE_FLAG_OPEN_REPARSE_POINT is essential here: without it, CreateFile
-// transparently follows a symlink/junction planted at path and reports
-// information about whatever it points AT instead of the link itself, which
-// would make this whole check trivially bypassable by an attacker.
-func inspectExistingStagingFile(path string) (safeToReclaim bool, reason string, err error) {
+// refusalWithClose closes f and folds a close failure into the refusal error,
+// keeping errors.Is(.., ErrStagingFileRefused) true.
+func refusalWithClose(f *os.File, refusal error) error {
+	if closeErr := f.Close(); closeErr != nil {
+		return fmt.Errorf("%w (additionally, closing the handle failed: %w)", refusal, closeErr)
+	}
+	return refusal
+}
+
+// statStagingFileNoFollow opens path WITHOUT following any reparse point
+// (symlink/junction) and reports its size and whether it is a "plain" file:
+// not a reparse point, not a directory, and with exactly one hard link.
+// FILE_FLAG_OPEN_REPARSE_POINT is essential: without it CreateFile would
+// transparently follow a planted link and describe whatever it points AT.
+// When plain is false, reason explains why.
+func statStagingFileNoFollow(path string) (size uint64, plain bool, reason string, err error) {
 	pathPtr, cerr := windows.UTF16PtrFromString(path)
 	if cerr != nil {
-		return false, "", fmt.Errorf("convert path %q to UTF-16: %w", path, cerr)
+		return 0, false, "", fmt.Errorf("convert path %q to UTF-16: %w", path, cerr)
 	}
 	h, cerr := windows.CreateFile(
 		pathPtr,
@@ -3455,26 +3631,39 @@ func inspectExistingStagingFile(path string) (safeToReclaim bool, reason string,
 		0,
 	)
 	if cerr != nil {
-		return false, "", fmt.Errorf("CreateFile failed: %w", cerr)
+		return 0, false, "", fmt.Errorf("CreateFile failed: %w", cerr)
 	}
-	defer CloseHandleLogged(&h, "inspectExistingStagingFile:CreateFile h")
+	defer CloseHandleLogged(&h, "statStagingFileNoFollow:CreateFile h")
 
 	var info windows.ByHandleFileInformation
 	if gerr := windows.GetFileInformationByHandle(h, &info); gerr != nil {
-		return false, "", fmt.Errorf("GetFileInformationByHandle failed: %w", gerr)
+		return 0, false, "", fmt.Errorf("GetFileInformationByHandle failed: %w", gerr)
 	}
+	size = (uint64(info.FileSizeHigh) << 32) | uint64(info.FileSizeLow)
 
-	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return false, "it is a symlink/junction/reparse point, not a plain regular file", nil
+	switch {
+	case info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0:
+		return size, false, "it is a symlink/junction/reparse point, not a plain regular file", nil
+	case info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0:
+		return size, false, "it is a directory, not a regular file", nil
+	case info.NumberOfLinks > 1:
+		return size, false, "it has multiple hard links", nil
 	}
-	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
-		return false, "it is a directory, not a regular file", nil
+	return size, true, "", nil
+}
+
+// inspectExistingStagingFile reports whether the existing file at path is safe
+// to reclaim as a benign, previously-written-but-not-yet-cleaned-up staging
+// file: a plain regular file, zero bytes long, with exactly one hard link.
+func inspectExistingStagingFile(path string) (safeToReclaim bool, reason string, err error) {
+	size, plain, why, statErr := statStagingFileNoFollow(path)
+	if statErr != nil {
+		return false, "", statErr
 	}
-	if info.NumberOfLinks > 1 {
-		return false, "it has multiple hard links", nil
+	if !plain {
+		return false, why, nil
 	}
-	if info.FileSizeHigh != 0 || info.FileSizeLow != 0 {
-		size := (uint64(info.FileSizeHigh) << 32) | uint64(info.FileSizeLow)
+	if size != 0 {
 		return false, fmt.Sprintf("it already contains data (%d byte(s))", size), nil
 	}
 	return true, "", nil
@@ -3484,7 +3673,15 @@ func inspectExistingStagingFile(path string) (safeToReclaim bool, reason string,
 // It attempts deletion first. If deletion fails, it forces a truncation down to 0 bytes
 // to neutralize any partial garbage data that would trip up the next boot.
 func neutralizeOrPanic(tmpName string, perm os.FileMode, maxAttempts int, backoff time.Duration, log *slog.Logger, actionErr error, title, extraPanicMsg string) {
-	ondeleteErr := RetryFileOp(maxAttempts, backoff, func() error { return OsRemoveFunc(tmpName) })
+	ondeleteErr := RetryFileOp(maxAttempts, backoff, func() error {
+		// A staging file that doesn't exist is already neutralized (e.g. its
+		// creation failed because the directory isn't writable); retrying or
+		// truncating a missing file would only end in a bogus critical panic.
+		if err := OsRemoveFunc(tmpName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove staging file %q: %w", tmpName, err)
+		}
+		return nil
+	})
 	if ondeleteErr == nil {
 		log.Debug("ExtraSafety: successfully neutralized staging file by deleting it", slog.String("tempfilename", tmpName))
 		// Successful deletion, nothing more to do
