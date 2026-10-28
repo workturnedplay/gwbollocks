@@ -63,6 +63,9 @@ func forEachAdapter(flags uint32, visit func(a *windows.IpAdapterAddresses) (sto
 			runtime.KeepAlive(b) // the visited pointers point INTO b, but are stored in noscan memory
 			return nil
 		}
+		if errors.Is(err, windows.ERROR_NO_DATA) {
+			return nil // no adapters at all
+		}
 		if !errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
 			return fmt.Errorf("GetAdaptersAddresses failed: %w", err)
 		}
@@ -92,22 +95,75 @@ func getInterfaceGUID(ifIndex uint32) (string, error) {
 	return guid, nil
 }
 
+// errDHCPEnabled is returned (wrapped) by checkInterfaceDHCPDisabled when the interface uses DHCP.
+var errDHCPEnabled = errors.New("DHCP is enabled on the selected interface")
+
+const persistentRoutesKeyPath = `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes`
+
+func interfaceRegistryKeyPath(guid string) string {
+	return `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\` + guid
+}
+
+func closeRegistryKey(k registry.Key, path string) {
+	if closeErr := k.Close(); closeErr != nil {
+		redPrintf("Warning: failed to close registry key %s: %v\n", path, closeErr)
+	}
+}
+
+// checkInterfaceDHCPDisabled returns an error wrapping errDHCPEnabled if the interface (by GUID) has EnableDHCP != 0:
+// the DHCP client would keep (re)installing its own default gateway behind our back, so this tool can't work right.
+// A missing EnableDHCP value counts as static. Any other failure is returned as a plain wrapped error.
+func checkInterfaceDHCPDisabled(guid string) error {
+	path := interfaceRegistryKeyPath(guid)
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.QUERY_VALUE)
+	if err != nil {
+		return fmt.Errorf("failed to open registry key %s, err: %w", path, err)
+	}
+	defer closeRegistryKey(k, path)
+
+	enabled, _, err := k.GetIntegerValue("EnableDHCP")
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("failed to read EnableDHCP from registry key %s, err: %w", path, err)
+	}
+	if enabled != 0 {
+		return fmt.Errorf("%w: interface %s has EnableDHCP=%d, switch the adapter to a static IP first", errDHCPEnabled, guid, enabled)
+	}
+	return nil
+}
+
+// countLegacyPersistentRoutes returns how many values the legacy PersistentRoutes registry key holds (0 if the key is absent).
+func countLegacyPersistentRoutes() (uint32, error) {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, persistentRoutesKeyPath, registry.QUERY_VALUE)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to open registry key %s, err: %w", persistentRoutesKeyPath, err)
+	}
+	defer closeRegistryKey(k, persistentRoutesKeyPath)
+
+	info, err := k.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat registry key %s, err: %w", persistentRoutesKeyPath, err)
+	}
+	return info.ValueCount, nil
+}
+
 func clearPersistentGatewayForIndex(ifIndex uint32) error {
 	guid, err := getInterfaceGUID(ifIndex)
 	if err != nil {
 		return fmt.Errorf("failed to get GUID: %w", err)
 	}
 
-	path := fmt.Sprintf(`SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\%s`, guid)
+	path := interfaceRegistryKeyPath(guid)
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.SET_VALUE|registry.QUERY_VALUE)
 	if err != nil {
 		return fmt.Errorf("failed to open registry key %s, err: %w", path, err)
 	}
-	defer func() {
-		if closeErr := k.Close(); closeErr != nil {
-			redPrintf("Warning: failed to close registry key %s: %v\n", path, closeErr)
-		}
-	}()
+	defer closeRegistryKey(k, path)
 
 	// Writing an empty slice to a MULTI_SZ effectively clears the list.
 	// If Windows deletes the key entirely, that's actually fine—it means "No GW".
@@ -775,7 +831,23 @@ func consoleCtrlHandler(ctrlType uint32) uintptr {
 	return 0 // Pass unhandled events back to OS defaults // Pass other events back to Windows defaults
 }
 
+// Process exit codes. 2 is deliberately unused (Go itself exits with 2 on an unrecovered panic) and so is 130
+// (run.bat treats that one as "restart me").
+const (
+	exitOK          = 0
+	exitFailure     = 1 // an API call or other runtime operation failed
+	exitConfig      = 3 // missing/invalid gateway.cfg contents
+	exitNotAdmin    = 4 // not elevated
+	exitUnsupported = 5 // eg. DHCP is enabled on the chosen interface
+)
+
 func main() {
+	// run() returns instead of calling os.Exit itself so that all of its defers (gateway removal, console mode
+	// restore, "press any key") get to run first.
+	os.Exit(run())
+}
+
+func run() int {
 	// Top-level defer: Executes last! Restored console state guarantees exclusive, clean access here.
 	defer func() {
 		if !wincoe.WaitAnyKeyIfInteractive() {
@@ -783,75 +855,92 @@ func main() {
 		}
 	}()
 
-	if err := listIfIndexes(); err != nil {
-		fmt.Println("Error listing interfaces:", err)
-	} else {
-		if err := listInterfaceIPs(); err != nil {
-			fmt.Println("Error listing interfaces:", err)
-		}
+	// Both listings are informational only, so one failing doesn't skip the other.
+	if listErr := listIfIndexes(); listErr != nil {
+		redPrintf("Error listing interfaces: %v\n", listErr)
+	}
+	if listErr := listInterfaceIPs(); listErr != nil {
+		redPrintf("Error listing interface IPs: %v\n", listErr)
 	}
 
 	ifIndex, err := getTargetInterfaceWithRetry()
 	if err != nil {
 		redPrintf("Cannot get default interface: %v\n", err)
-		return
+		return exitFailure
+	}
+	fmt.Printf("default interface index: %d\n", ifIndex)
+
+	guid, err := getInterfaceGUID(ifIndex)
+	if err != nil {
+		redPrintf("Cannot resolve the GUID of interface %d: %v\n", ifIndex, err)
+		return exitFailure
 	}
 
-	fmt.Printf("default interface index: %d\n", ifIndex)
+	if err = checkInterfaceDHCPDisabled(guid); err != nil {
+		if errors.Is(err, errDHCPEnabled) {
+			redPrintf("%v\n", err)
+			return exitUnsupported
+		}
+		yellowPrintf("Warning: couldn't verify that DHCP is disabled on interface %s: %v\n", guid, err)
+	}
+
+	if count, countErr := countLegacyPersistentRoutes(); countErr != nil {
+		yellowPrintf("Warning: couldn't check the legacy persistent routes: %v\n", countErr)
+	} else if count > 0 {
+		yellowPrintf("Warning: the legacy registry key HKLM\\%s isn't empty (%d value(s)); those routes survive reboots and can conflict with this tool (see 'Persistent Routes' in 'route print -4').\n",
+			persistentRoutesKeyPath, count)
+	}
 
 	exists, existingGW, err := hasDefaultGateway(ifIndex)
 	if err != nil {
-		fmt.Println(err)
-		return
+		redPrintf("Cannot check for an existing default gateway: %v\n", err)
+		return exitFailure
 	}
-
 	if exists {
-		fmt.Printf("raw:        0x%08X\n", existingGW)
-		redPrintf("Warning: default gateway already exists on this interface: %s\n", ipv4StringLE(existingGW))
+		redPrintf("Warning: default gateway already exists on this interface: %s (raw 0x%08X)\n", ipv4StringLE(existingGW), existingGW)
 	}
 
 	// Example gateway, replace with the “real” GW you want
 	wantedGW, err := getWantedGW()
 	if err != nil {
 		redPrintf("need to know which gw to set: %v\n", err)
-		return
-	} else {
-		fmt.Printf("Read gw '%s' from file '%s'\n", wantedGW, gwFile)
+		return exitConfig
 	}
+	fmt.Printf("Read gw '%s' from file '%s'\n", wantedGW, gwFile)
+
 	targetGW, err := ipv4ToUint32LE(wantedGW)
 	if err != nil {
 		redPrintf("Failed to convert wanted gw IP %s into uint32: %v\n", wantedGW, err)
-		return
+		return exitConfig
 	}
 	if targetGW == 0 || targetGW == ^uint32(0) {
 		redPrintf("The wanted gw %s (0.0.0.0 or 255.255.255.255) isn't a usable gateway address\n", wantedGW)
-		return
+		return exitConfig
 	}
 
 	fmt.Printf("The gateway that we want is %s aka 0x%08X\n",
 		ipv4StringLE(targetGW), targetGW)
 
 	token := windows.GetCurrentProcessToken()
-	var isAdmin bool = token.IsElevated()
-	if !isAdmin {
+	if !token.IsElevated() {
 		redPrintf("Must run as admin to effect changes!\n")
-		return
+		return exitNotAdmin
 	}
 
 	// 1. Put Stdin into raw mode so we can capture Ctrl+R instantly (without hitting Enter)
 	// We also clear ENABLE_PROCESSED_INPUT, so Ctrl+C arrives as the plain byte 3 (handled in the loop below) instead of a signal.
 	var oldMode uint32
-	if err := windows.GetConsoleMode(windows.Stdin, &oldMode); err != nil {
-		redPrintf("Warning: GetConsoleMode failed, Ctrl+R raw-mode toggling won't work: %v\n", err)
+	if modeErr := windows.GetConsoleMode(windows.Stdin, &oldMode); modeErr != nil {
+		redPrintf("Warning: GetConsoleMode failed, Ctrl+R raw-mode toggling won't work: %v\n", modeErr)
 	} else {
 		newMode := oldMode &^ (windows.ENABLE_LINE_INPUT | windows.ENABLE_ECHO_INPUT | windows.ENABLE_PROCESSED_INPUT)
-		if err := windows.SetConsoleMode(windows.Stdin, newMode); err != nil {
-			redPrintf("Warning: SetConsoleMode(raw) failed, Ctrl+R raw-mode toggling won't work: %v\n", err)
+		if setErr := windows.SetConsoleMode(windows.Stdin, newMode); setErr != nil {
+			redPrintf("Warning: SetConsoleMode(raw) failed, Ctrl+R raw-mode toggling won't work: %v\n", setErr)
 		} else {
 			// Executes 2nd on exit, restoring cooked console
 			defer func() {
-				if err := windows.SetConsoleMode(windows.Stdin, oldMode); err != nil {
-					redPrintf("Warning: failed to restore original console mode on exit: %v\n", err)
+				if restoreErr := windows.SetConsoleMode(windows.Stdin, oldMode); restoreErr != nil {
+					redPrintf("Warning: failed to restore original console mode on exit: %v\n", restoreErr)
 				}
 			}()
 		}
@@ -866,12 +955,12 @@ func main() {
 	activate := func() {
 		stateMu.Lock()
 		defer stateMu.Unlock()
-		if err := clearPersistentGatewayForIndex(ifIndex); err != nil {
-			fmt.Println("Failed to delete persistent gateway(ie. the one set in LAN adapter settings, seen by 'route print' under 'Persistent Routes'), err:", err)
+		if clearErr := clearPersistentGatewayForIndex(ifIndex); clearErr != nil {
+			redPrintf("Failed to delete persistent gateway(ie. the one set in LAN adapter settings, seen by 'route print' under 'Persistent Routes'), err: %v\n", clearErr)
 			return //XXX: yes, we don't wanna continue if this fails
 		}
-		if err := forceSetDefaultGateway(targetGW, ifIndex); err != nil {
-			redPrintf("Failed to set gateway: %v\n", err)
+		if setErr := forceSetDefaultGateway(targetGW, ifIndex); setErr != nil {
+			redPrintf("Failed to set gateway: %v\n", setErr)
 			return
 		}
 		isActive = true
@@ -893,19 +982,16 @@ func main() {
 	// Guarantee cleanup on exit (handles Ctrl+C or normal return)
 	defer deactivate()
 
-	// Bind the local closure to the global function holder
-	// Bind our local cleanup logic to the package-level anchor
+	// Bind our local cleanup logic to the package-level anchor the console ctrl handler uses
 	globalCleanup = deactivate
 
 	// Register the callback with Windows via kernel32.dll using wincoe's bound wrapper
-	res := wincoe.RegisterCtrlHandler(consoleCtrlHandler)
-	if res.Failed() {
+	if res := wincoe.RegisterCtrlHandler(consoleCtrlHandler); res.Failed() {
 		redPrintf("CRITICAL: Failed to register console control handler: %v\n", res.Err)
-		return
-	} else {
-		// Just a quiet sanity check confirmation during startup
-		fmt.Println("OS termination handler successfully registered.")
+		return exitFailure
 	}
+	// Just a quiet sanity check confirmation during startup
+	fmt.Println("OS termination handler successfully registered.")
 
 	// Initial Activation
 	activate()
@@ -916,8 +1002,12 @@ func main() {
 	// Sequential loop on the main goroutine
 	buf := make([]byte, 1)
 	for {
-		n, err := os.Stdin.Read(buf)
-		if err != nil || n == 0 {
+		n, readErr := os.Stdin.Read(buf)
+		if readErr != nil || n == 0 {
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				redPrintf("Reading stdin failed, cleaning up and exiting: %v\n", readErr)
+				return exitFailure
+			}
 			break
 		}
 		if buf[0] == 3 { // 0x03 = Ctrl+C
@@ -932,4 +1022,5 @@ func main() {
 			}
 		}
 	}
+	return exitOK
 }
