@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows && amd64
 
 // Copyright 2026 workturnedplay
 //
@@ -18,13 +18,17 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -33,27 +37,59 @@ import (
 	"github.com/workturnedplay/wincoe"
 )
 
-func getInterfaceGUID(ifIndex uint32) (string, error) {
-	size := uint32(15000) // Initial buffer
-	for {
+const (
+	errnoObjectAlreadyExists = windows.Errno(5010) // ERROR_OBJECT_ALREADY_EXISTS
+	errnoNotFound            = windows.Errno(1168) // ERROR_NOT_FOUND
+)
+
+// forEachAdapter calls visit for every adapter GetAdaptersAddresses reports (IPv4 family), until visit returns true.
+// It owns the grow-and-retry-on-ERROR_BUFFER_OVERFLOW dance (bounded, unlike the two hand-rolled unbounded
+// loops this replaces) and keeps the buffer alive for as long as the visited pointers are in use.
+func forEachAdapter(flags uint32, visit func(a *windows.IpAdapterAddresses) (stop bool)) error {
+	const maxAttempts = 5
+	size := uint32(15000)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if size == 0 {
+			return errors.New("GetAdaptersAddresses: zero-sized buffer requested, can't continue")
+		}
 		b := make([]byte, size)
-		// 1 = AF_INET (IPv4), 0 = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST
-		err := windows.GetAdaptersAddresses(windows.AF_INET, 0, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &size)
+		err := windows.GetAdaptersAddresses(windows.AF_INET, flags, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &size)
 		if err == nil {
-			addr := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0]))
-			for addr != nil {
-				if addr.IfIndex == ifIndex {
-					// Windows returns the GUID as the "AdapterName"
-					return windows.BytePtrToString(addr.AdapterName), nil
+			for addr := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])); addr != nil; addr = addr.Next {
+				if visit(addr) {
+					break
 				}
-				addr = addr.Next
 			}
-			return "", fmt.Errorf("GUID not found for index %d", ifIndex)
+			runtime.KeepAlive(b) // the visited pointers point INTO b, but are stored in noscan memory
+			return nil
 		}
 		if !errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
-			return "", fmt.Errorf("GetAdaptersAddresses failed, err: %w", err)
-		} // else continue doing it again with the new size I guess
+			return fmt.Errorf("GetAdaptersAddresses failed: %w", err)
+		}
+		// 'size' now holds the required size; loop to retry with it.
 	}
+	return fmt.Errorf("GetAdaptersAddresses: required buffer size kept changing across %d attempts, giving up", maxAttempts)
+}
+
+func getInterfaceGUID(ifIndex uint32) (string, error) {
+	var guid string
+	found := false
+	//0 = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST
+	if err := forEachAdapter(0, func(a *windows.IpAdapterAddresses) bool {
+		if a.IfIndex != ifIndex {
+			return false
+		}
+		// Windows returns the GUID as the "AdapterName"
+		guid = windows.BytePtrToString(a.AdapterName)
+		found = true
+		return true
+	}); err != nil {
+		return "", fmt.Errorf("getInterfaceGUID(index %d): %w", ifIndex, err)
+	}
+	if !found {
+		return "", fmt.Errorf("GUID not found for index %d", ifIndex)
+	}
+	return guid, nil
 }
 
 func clearPersistentGatewayForIndex(ifIndex uint32) error {
@@ -77,13 +113,13 @@ func clearPersistentGatewayForIndex(ifIndex uint32) error {
 	// If Windows deletes the key entirely, that's actually fine—it means "No GW".
 	err = k.SetStringsValue("DefaultGateway", []string{})
 	if err != nil {
-		return fmt.Errorf("failed to clear DefaultGateway for GUID interface '%s' with indef '%d', err: %w", guid, ifIndex, err)
+		return fmt.Errorf("failed to clear DefaultGateway for GUID interface '%s' with index '%d', err: %w", guid, ifIndex, err)
 	}
 
 	// Also clear the metric to prevent "ghost" metrics
 	err = k.SetStringsValue("DefaultGatewayMetric", []string{})
 	if err != nil {
-		return fmt.Errorf("failed to clear DefaultGatewayMetric for GUID interface '%s' with indef '%d', err: %w", guid, ifIndex, err)
+		return fmt.Errorf("failed to clear DefaultGatewayMetric for GUID interface '%s' with index '%d', err: %w", guid, ifIndex, err)
 	}
 
 	fmt.Printf("Successfully scrubbed Registry for Interface %s with index %d\n", guid, ifIndex)
@@ -92,22 +128,22 @@ func clearPersistentGatewayForIndex(ifIndex uint32) error {
 
 // little endian like Windows
 func ipv4ToUint32LE(ip string) (uint32, error) {
-	var b [4]byte
-	n, err := fmt.Sscanf(ip, "%d.%d.%d.%d", &b[0], &b[1], &b[2], &b[3])
-	if err != nil || n != 4 {
-		return 0, fmt.Errorf("invalid IPv4: %q", ip)
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return 0, fmt.Errorf("invalid IPv4 %q: %w", ip, err)
 	}
+	if !addr.Is4() {
+		return 0, fmt.Errorf("invalid IPv4 %q: not an IPv4 address", ip)
+	}
+	b := addr.As4()
 	return binary.LittleEndian.Uint32(b[:]), nil
 }
 
 // little endian like Windows
 func ipv4StringLE(ip uint32) string {
-	return fmt.Sprintf("%d.%d.%d.%d",
-		byte(ip&0xFF),
-		byte((ip>>8)&0xFF),
-		byte((ip>>16)&0xFF),
-		byte((ip>>24)&0xFF),
-	)
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], ip)
+	return netip.AddrFrom4(b).String()
 }
 
 // fetchIphlpapiTable implements the standard two-call "query required size,
@@ -132,6 +168,9 @@ func fetchIphlpapiTable(what string, query func(pv unsafe.Pointer, size *uint32)
 	var size uint32
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		res := query(nil, &size)
+		if res.Failed() && res.ErrIs(windows.ERROR_NO_DATA) {
+			return nil, nil // Iphlpapi's way of saying "empty table"
+		}
 		if res.Failed() && !res.ErrIs(windows.ERROR_INSUFFICIENT_BUFFER) {
 			return nil, fmt.Errorf("%s size query failed: %w", what, res.Err)
 		}
@@ -146,10 +185,10 @@ func fetchIphlpapiTable(what string, query func(pv unsafe.Pointer, size *uint32)
 		buf := make([]byte, size)
 		res = query(unsafe.Pointer(&buf[0]), &size)
 		if res.Succeeded() {
-			if len(buf) < 4 {
-				return nil, fmt.Errorf("%s returned a buffer too small to contain even the entry count (%d byte(s))", what, len(buf))
-			}
 			return buf, nil
+		}
+		if res.ErrIs(windows.ERROR_NO_DATA) {
+			return nil, nil
 		}
 		if !res.ErrIs(windows.ERROR_INSUFFICIENT_BUFFER) {
 			return nil, fmt.Errorf("%s failed: %w", what, res.Err)
@@ -160,130 +199,124 @@ func fetchIphlpapiTable(what string, query func(pv unsafe.Pointer, size *uint32)
 	return nil, fmt.Errorf("%s: table size kept changing across %d attempts, giving up", what, maxAttempts)
 }
 
+// fetchIphlpapiRows runs fetchIphlpapiTable and reinterprets the buffer (a DWORD entry count followed by that many
+// rows of type T) as a []T that aliases the buffer, after verifying the claimed row count actually fits in it.
+// Returns (nil, nil) for an empty table.
+func fetchIphlpapiRows[T any](what string, query func(pv unsafe.Pointer, size *uint32) wincoe.WinResult) ([]T, error) {
+	buf, err := fetchIphlpapiTable(what, query)
+	if err != nil {
+		return nil, fmt.Errorf("fetchIphlpapiRows(%s): %w", what, err)
+	}
+	if buf == nil {
+		return nil, nil
+	}
+	if len(buf) < 4 {
+		return nil, fmt.Errorf("%s returned a buffer too small to contain even the entry count (%d byte(s))", what, len(buf))
+	}
+
+	num := binary.LittleEndian.Uint32(buf[:4])
+	if num == 0 {
+		return nil, nil
+	}
+
+	var zero T
+	rowSize := uint64(unsafe.Sizeof(zero))
+	if uint64(num)*rowSize > uint64(len(buf)-4) {
+		return nil, fmt.Errorf("%s claims %d row(s) of %d byte(s) each but only %d byte(s) follow the entry count", what, num, rowSize, len(buf)-4)
+	}
+	// All of these tables are DWORD-only structs (align 4) and start right after the 4-byte count; there is NO
+	// extra x64 padding there (the old "x64 FIX" comments were wrong, offset 4 was always the correct one).
+	return unsafe.Slice((*T)(unsafe.Pointer(&buf[4])), num), nil
+}
+
+func queryIPForwardTable(pv unsafe.Pointer, size *uint32) wincoe.WinResult {
+	return wincoe.GetIpForwardTable(pv, size, false)
+}
+
+func isDefaultRouteOn(row *wincoe.MIB_IPFORWARDROW, ifIndex uint32) bool {
+	return row.ForwardDest == 0 && row.ForwardMask == 0 && row.ForwardIfIndex == ifIndex
+}
+
+// ifRowDescription returns the (ANSI) description of row, up to its NUL terminator.
+func ifRowDescription(row *wincoe.MIB_IFROW) string {
+	d := row.Descr[:min(int(row.DescrLen), len(row.Descr))]
+	if i := bytes.IndexByte(d, 0); i >= 0 {
+		d = d[:i]
+	}
+	return string(d) // not byte-by-byte string(rune): that mangled non-ASCII descriptions
+}
+
 func listInterfaceIPs() error {
-	buf, err := fetchIphlpapiTable("GetIpAddrTable", func(pv unsafe.Pointer, size *uint32) wincoe.WinResult {
+	rows, err := fetchIphlpapiRows[wincoe.MIB_IPADDRROW]("GetIpAddrTable", func(pv unsafe.Pointer, size *uint32) wincoe.WinResult {
 		return wincoe.GetIpAddrTable(pv, size, false)
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("listInterfaceIPs: %w", err)
 	}
 
-	var num uint32
-	if buf != nil {
-		num = *(*uint32)(unsafe.Pointer(&buf[0]))
-	}
-	fmt.Printf("\n--- IP Address Table (%d entries) ---\n", num)
-
-	// Each row is 24 bytes (5*4 + 2*2)
-	rowSize := uintptr(24)
-	offset := uintptr(4)
-
-	for i := uint32(0); i < num; i++ {
-		row := (*wincoe.MIB_IPADDRROW)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + offset))
-
-		ip := *(*[4]byte)(unsafe.Pointer(&row.Addr))
-		mask := *(*[4]byte)(unsafe.Pointer(&row.Mask))
-
-		fmt.Printf("IF Index %d: IP %d.%d.%d.%d | Mask %d.%d.%d.%d\n",
-			row.Index,
-			ip[0], ip[1], ip[2], ip[3],
-			mask[0], mask[1], mask[2], mask[3])
-
-		offset += rowSize
+	fmt.Printf("\n--- IP Address Table (%d entries) ---\n", len(rows))
+	for i := range rows {
+		row := &rows[i]
+		fmt.Printf("IF Index %d: IP %s | Mask %s\n", row.Index, ipv4StringLE(row.Addr), ipv4StringLE(row.Mask))
 	}
 	fmt.Println("-------------------------------------")
 	return nil
 }
 
 func listIfIndexes() error {
-	buf, err := fetchIphlpapiTable("GetIfTable", func(pv unsafe.Pointer, size *uint32) wincoe.WinResult {
+	rows, err := fetchIphlpapiRows[wincoe.MIB_IFROW]("GetIfTable", func(pv unsafe.Pointer, size *uint32) wincoe.WinResult {
 		return wincoe.GetIfTable(pv, size, false)
 	})
 	if err != nil {
-		return err
-	}
-	if buf == nil {
-		fmt.Println("Interfaces found: 0")
-		return nil
+		return fmt.Errorf("listIfIndexes: %w", err)
 	}
 
-	num := *(*uint32)(unsafe.Pointer(&buf[0]))
-	// x64 FIX: On 64-bit Windows, there are 4 bytes of padding after 'num'
-	// to align the first MIB_IFROW to 8 bytes.
-	// Offset is exactly 4 bytes (the size of 'num')
-	offset := uintptr(4)
-	rowSize := unsafe.Sizeof(wincoe.MIB_IFROW{})
-
-	fmt.Printf("Interfaces found: %d\n", num)
-
-	for i := uint32(0); i < num; i++ {
-		row := (*wincoe.MIB_IFROW)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + offset))
-
-		// Helper to convert the byte array description to a Go string
-		descr := ""
-		for j := 0; j < int(row.DescrLen) && j < 256; j++ {
-			if row.Descr[j] == 0 {
-				break
-			}
-			descr += string(row.Descr[j])
-		}
-
-		fmt.Printf("[%d] Index: %d, MTU: %d, Name: %s\n",
-			i, row.Index, row.Mtu, descr)
-
-		offset += rowSize
+	fmt.Printf("Interfaces found: %d\n", len(rows))
+	for i := range rows {
+		row := &rows[i]
+		fmt.Printf("[%d] Index: %d, MTU: %d, Name: %s\n", i, row.Index, row.Mtu, ifRowDescription(row))
 	}
 	return nil
 }
 
 // Enumerate routes and check if any default gateway exists on a given interface
 func hasDefaultGateway(ifIndex uint32) (bool, uint32, error) {
-	buf, err := fetchIphlpapiTable("GetIpForwardTable", func(pv unsafe.Pointer, size *uint32) wincoe.WinResult {
-		return wincoe.GetIpForwardTable(pv, size, false)
-	})
+	rows, err := fetchIphlpapiRows[wincoe.MIB_IPFORWARDROW]("GetIpForwardTable", queryIPForwardTable)
 	if err != nil {
-		return false, 0, err
+		return false, 0, fmt.Errorf("hasDefaultGateway: %w", err)
 	}
-	if buf == nil {
-		return false, 0, nil
-	}
-
-	num := *(*uint32)(unsafe.Pointer(&buf[0]))
-	// MIB_IPFORWARDTABLE also has the 4-byte padding on x64
-	offset := uintptr(4) // Reverted to 4 bytes
-	rowSize := unsafe.Sizeof(wincoe.MIB_IPFORWARDROW{})
-
-	for i := uint32(0); i < num; i++ {
-		row := (*wincoe.MIB_IPFORWARDROW)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + offset))
-		if row.ForwardDest == 0 && row.ForwardMask == 0 && row.ForwardIfIndex == ifIndex {
-			return true, row.ForwardNextHop, nil
+	for i := range rows {
+		if isDefaultRouteOn(&rows[i], ifIndex) {
+			return true, rows[i].ForwardNextHop, nil
 		}
-		offset += rowSize
 	}
 	return false, 0, nil
 }
 
+// consoleOutMu serializes colored console output: the console text attribute is process-global state and the
+// console ctrl handler prints (via deactivate) from a different OS thread than main(), so two interleaved
+// save/set/restore sequences could otherwise leave the console stuck in the wrong color.
+var consoleOutMu sync.Mutex
+
 func colorPrintf(color uint16, msg string, a ...any) {
-	hStdout := windows.Stdout
-	var csbi windows.ConsoleScreenBufferInfo
-	if err := windows.GetConsoleScreenBufferInfo(hStdout, &csbi); err != nil {
-		panic(fmt.Errorf("GetConsoleScreenBufferInfo failed: %w", err))
-	}
-	origAttr := csbi.Attributes
+	consoleOutMu.Lock()
+	defer consoleOutMu.Unlock()
 
-	err := wincoe.SetConsoleTextAttribute(hStdout, color)
-	if err != nil {
-		panic(err)
+	printed := false
+	err := wincoe.WithConsoleColor(windows.Stdout, color, func() {
+		printed = true
+		fmt.Printf(msg, a...)
+	})
+	if !printed {
+		// stdout isn't a console (redirected / no console attached): color is impossible, so print plain
+		// instead of panicking.
+		fmt.Printf(msg, a...)
+		return
 	}
-	fmt.Printf(msg, a...)
-
-	//restore
-	err = wincoe.SetConsoleTextAttribute(hStdout, origAttr)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Warning: couldn't restore the console color: %v\n", err) //nolint:errcheck // best-effort
 	}
 }
-
 func greenPrintf(msg string, a ...any) {
 	colorPrintf(wincoe.FOREGROUND_GREEN|wincoe.FOREGROUND_INTENSITY, msg, a...)
 }
@@ -303,53 +336,44 @@ func yellowPrintf(msg string, a ...any) {
 }
 
 func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
-	buf, err := fetchIphlpapiTable("GetIpForwardTable", func(pv unsafe.Pointer, size *uint32) wincoe.WinResult {
-		return wincoe.GetIpForwardTable(pv, size, false)
-	})
+	rows, err := fetchIphlpapiRows[wincoe.MIB_IPFORWARDROW]("GetIpForwardTable", queryIPForwardTable)
 	if err != nil {
 		// Best-effort: not knowing the existing routing table just means we
 		// fall back to "no existing route/metric found" below, same as the
-		// buf==nil (empty table) case.
+		// empty table case.
 		redPrintf("Warning: %v; proceeding without checking for a pre-existing default route\n", err)
 	}
 
 	var existingRow *wincoe.MIB_IPFORWARDROW
 	var ifMetric uint32
 
-	if buf != nil {
-		num := *(*uint32)(unsafe.Pointer(&buf[0]))
-		offset := uintptr(4)
-		rowSize := unsafe.Sizeof(wincoe.MIB_IPFORWARDROW{})
+	for i := range rows {
+		row := &rows[i]
 
-		for i := uint32(0); i < num; i++ {
-			row := (*wincoe.MIB_IPFORWARDROW)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + offset))
+		// TRACK METRIC: If this row belongs to our interface, save its metric
+		// as a candidate for our new route's metric.
+		if ifMetric == 0 && row.ForwardIfIndex == ifIndex {
+			ifMetric = row.ForwardMetric1
+		}
 
-			// TRACK METRIC: If this row belongs to our interface, save its metric
-			// as a candidate for our new route's metric.
-			if ifMetric == 0 && row.ForwardIfIndex == ifIndex {
-				ifMetric = row.ForwardMetric1
+		// If we find an active default gateway on our target interface...
+		if isDefaultRouteOn(row, ifIndex) {
+			// Save a clone of the first one we find to use as our "perfect template"
+			if existingRow == nil {
+				copiedRow := *row
+				existingRow = &copiedRow
 			}
-
-			// If we find an active default gateway on our target interface...
-			if row.ForwardDest == 0 && row.ForwardMask == 0 && row.ForwardIfIndex == ifIndex {
-				// Save a clone of the first one we find to use as our "perfect template"
-				if existingRow == nil {
-					copiedRow := *row
-					existingRow = &copiedRow
-				}
-				// 1. CLEAR THE PATH: Delete the exact route using the OS's own memory struct
-				if delRes := wincoe.DeleteIpForwardEntry(unsafe.Pointer(row)); delRes.Failed() {
-					redPrintf("Warning: failed to delete pre-existing default-route entry on interface %d: %v\n", ifIndex, delRes.Err)
-				}
+			// 1. CLEAR THE PATH: Delete the exact route using the OS's own memory struct
+			if delRes := wincoe.DeleteIpForwardEntry(unsafe.Pointer(row)); delRes.Failed() {
+				redPrintf("Warning: failed to delete pre-existing default-route entry on interface %d: %v\n", ifIndex, delRes.Err)
 			}
-			offset += rowSize
 		}
 	}
 
-	// FINAL FALLBACK: If we found no routes at all for this interface, use 25
+	// FINAL FALLBACK: If we found no routes at all for this interface, use 281
 	if ifMetric == 0 || ifMetric == ^uint32(0) {
 		ifMetric = 281
-		redPrintf("Couldn't find the metric automatically, using metric %d instead.", ifMetric)
+		redPrintf("Couldn't find the metric automatically, using metric %d instead.\n", ifMetric)
 	}
 
 	var newRow wincoe.MIB_IPFORWARDROW
@@ -408,9 +432,9 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 	res := wincoe.CreateIpForwardEntry(unsafe.Pointer(&row))
 	if res.Failed() {
 		//continue because it works w/o this anyway!
-		if res.ErrIs(windows.Errno(5010)) {
+		if res.ErrIs(errnoObjectAlreadyExists) {
 			// if The object already exists. (code 5010)
-			yellowPrintf("The entry for on-link gw already existed, err: %v", res.Err)
+			yellowPrintf("The entry for on-link gw already existed, err: %v\n", res.Err)
 		} else {
 			// if not: The object already exists. (code 5010)
 			//then nothing to remove as it failed to add it
@@ -423,7 +447,7 @@ func forceSetDefaultGateway(targetGW, ifIndex uint32) error {
 	removeActiveGateway = true // rather fail to delete it than miss deleting it due to race.
 	res = wincoe.CreateIpForwardEntry(unsafe.Pointer(&newRow))
 	if res.Failed() {
-		if res.ErrIs(windows.Errno(5010)) {
+		if res.ErrIs(errnoObjectAlreadyExists) {
 			// The object already exists. (code 5010)
 			redPrintf("Unexpectedly gw already exists(but shoulda been deleted before by our code): %v\n", res.Err)
 		} else {
@@ -481,7 +505,6 @@ func deleteDirectRoute(targetGW, ifIndex uint32) error {
 
 	res := wincoe.DeleteIpForwardEntry(unsafe.Pointer(&row))
 	if res.Failed() {
-		// 1168 is ERROR_NOT_FOUND. If it's already gone, we don't care.
 		return fmt.Errorf("DeleteDirectRoute failed: (%w)", res.Err)
 	}
 	return nil
@@ -494,9 +517,7 @@ func getDefaultIfIndex() (uint32, error) {
 	const commonIP = "1.1.1.1"
 	common, err := ipv4ToUint32LE(commonIP)
 	if err != nil {
-		//FIXME: DRY the message
-		redPrintf("Failed to convert common IP %s into uint32\n", commonIP)
-		return 0, fmt.Errorf("failed to convert common IP %s into uint32", commonIP)
+		return 0, fmt.Errorf("failed to convert common IP %s into uint32: %w", commonIP, err)
 	}
 
 	res := wincoe.GetBestInterface(common, &ifIndex)
@@ -515,69 +536,56 @@ type NetworkAdapter struct {
 
 func getPhysicalAdapters() ([]NetworkAdapter, error) {
 	var adapters []NetworkAdapter
-	size := uint32(15000)
-
-	for {
-		b := make([]byte, size)
-		err := windows.GetAdaptersAddresses(windows.AF_INET, windows.GAA_FLAG_SKIP_ANYCAST, 0, (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0])), &size)
-		if err == nil {
-			addr := (*windows.IpAdapterAddresses)(unsafe.Pointer(&b[0]))
-			for addr != nil {
-				// 6 = Ethernet, 71 = WiFi, and status must be "Up"
-				if (addr.IfType == 6 || addr.IfType == 71) && addr.OperStatus == windows.IfOperStatusUp {
-					ipStr := "No IP"
-					if addr.FirstUnicastAddress != nil {
-						// Extracting the IPv4 string for display
-						sa := (*windows.RawSockaddrInet4)(unsafe.Pointer(addr.FirstUnicastAddress.Address.Sockaddr))
-						ipStr = fmt.Sprintf("%d.%d.%d.%d", sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3])
-					}
-
-					adapters = append(adapters, NetworkAdapter{
-						Index:       addr.IfIndex,
-						GUID:        windows.BytePtrToString(addr.AdapterName),
-						Description: windows.UTF16PtrToString(addr.Description),
-						IP:          ipStr,
-					})
-				}
-				addr = addr.Next
+	err := forEachAdapter(windows.GAA_FLAG_SKIP_ANYCAST, func(a *windows.IpAdapterAddresses) bool {
+		// 6 = Ethernet, 71 = WiFi, and status must be "Up"
+		if (a.IfType != 6 && a.IfType != 71) || a.OperStatus != windows.IfOperStatusUp {
+			return false
+		}
+		ipStr := "No IP"
+		if a.FirstUnicastAddress != nil && a.FirstUnicastAddress.Address.Sockaddr != nil {
+			// Extracting the IPv4 string for display
+			sa := (*windows.RawSockaddrInet4)(unsafe.Pointer(a.FirstUnicastAddress.Address.Sockaddr))
+			if sa.Family == windows.AF_INET {
+				ipStr = netip.AddrFrom4(sa.Addr).String()
 			}
-			return adapters, nil
 		}
-		if !errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
-			return nil, fmt.Errorf("GetAdaptersAddresses failed: %w", err)
-		}
+		adapters = append(adapters, NetworkAdapter{
+			Index:       a.IfIndex,
+			GUID:        windows.BytePtrToString(a.AdapterName),
+			Description: windows.UTF16PtrToString(a.Description),
+			IP:          ipStr,
+		})
+		return false
+	})
+	if err != nil {
+		return nil, fmt.Errorf("getPhysicalAdapters: %w", err)
 	}
+	return adapters, nil
 }
 
-func getTargetInterface() (uint32, string, error) {
-	// 1. Try the "Easy Way" (works if a gateway exists)
+func getTargetInterface() (uint32, error) {
+	// 1. Try the "Easy Way" (works if a default route exists)
 	idx, err := getDefaultIfIndex()
 	if err == nil {
-		// We still need the GUID for registry cleaning; a lookup failure here
-		// is non-fatal (the interface index itself is still perfectly usable),
-		// so just warn instead of aborting interface selection over it.
-		guid, guidErr := getInterfaceGUID(idx)
-		if guidErr != nil {
-			redPrintf("Warning: failed to resolve interface GUID for index %d (registry cleanup may be incomplete): %v\n", idx, guidErr)
-		}
-		return idx, guid, nil
+		return idx, nil
 	}
 
-	// 2. Error 1231 happened! The routing table is empty.
-	fmt.Println("No existing gateway found, this is better.")
+	// 2. Typically error 1231 (routing table has no default route): ask which adapter.
+	fmt.Printf("No existing default route found (%v), so selecting the adapter manually.\n", err)
 	adapter, err := UserSelectInterface()
 	if err != nil {
-		return 0, "", fmt.Errorf("failed selecting adapter: %w", err)
+		return 0, fmt.Errorf("failed selecting adapter: %w", err)
 	}
-
-	// Return the Index for CreateIpForwardEntry and the GUID for registry cleaning
-	return adapter.Index, adapter.GUID, nil
+	return adapter.Index, nil
 }
 
 func UserSelectInterface() (NetworkAdapter, error) {
 	adapters, err := getPhysicalAdapters()
-	if err != nil || len(adapters) == 0 {
-		return NetworkAdapter{}, fmt.Errorf("could not find any active physical adapters (ie. LAN cable not plugged in)")
+	if err != nil {
+		return NetworkAdapter{}, fmt.Errorf("could not enumerate the active physical adapters: %w", err)
+	}
+	if len(adapters) == 0 {
+		return NetworkAdapter{}, errors.New("could not find any active physical adapters (ie. LAN cable not plugged in)")
 	}
 	if len(adapters) == 1 {
 		return adapters[0], nil
@@ -629,7 +637,7 @@ func getWantedGW() (string, error) {
 	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimPrefix(scanner.Text(), "\uFEFF") // Notepad & co. may prepend a UTF-8 BOM
 
 		// 1. Strip comments
 		if commentIdx := strings.Index(line, "#"); commentIdx != -1 {
@@ -651,7 +659,7 @@ func getWantedGW() (string, error) {
 	// Logic Check
 	switch len(foundIPs) {
 	case 0:
-		return "", fmt.Errorf("error: No gateway IP found in gateway.cfg")
+		return "", fmt.Errorf("no gateway IP found in %q", gwFile)
 	case 1:
 		gatewayIP := foundIPs[0]
 		return gatewayIP, nil
@@ -671,7 +679,7 @@ func getWantedGW() (string, error) {
 // satisfied, so looping forever would just hang the process).
 func getTargetInterfaceWithRetry() (uint32, error) {
 	for {
-		ifIndex, _, err := getTargetInterface()
+		ifIndex, err := getTargetInterface()
 		if err == nil {
 			return ifIndex, nil
 		}
@@ -717,7 +725,7 @@ func waitAnyKeyRaw() {
 func onlinkgatewayremoval(targetGW, ifIndex uint32, complainIfFails bool) {
 	if removeDirectGWRoute {
 		if err := deleteDirectRoute(targetGW, ifIndex); err != nil {
-			if errors.Is(err, windows.Errno(1168)) {
+			if errors.Is(err, errnoNotFound) {
 				yellowPrintf("Apparently the on-link gateway entry was already removed, possibly by another instance u ran in parallel and exited! err: %v\n", err)
 			} else {
 				redPrintf("Failed to delete the on-link gateway: %v\n", err)
@@ -734,7 +742,7 @@ func onlinkgatewayremoval(targetGW, ifIndex uint32, complainIfFails bool) {
 func defaultgatewayremoval(targetGW, ifIndex uint32, complainIfFails bool) {
 	if removeActiveGateway {
 		if err := deleteDefaultGateway(targetGW, ifIndex); err != nil {
-			if errors.Is(err, windows.Errno(1168)) {
+			if errors.Is(err, errnoNotFound) {
 				yellowPrintf("Apparently the gateway was already removed, possibly by another instance u ran in parallel and exited! err: %v\n", err)
 			} else {
 				redPrintf("Failed to delete gateway: %v\n", err)
@@ -805,14 +813,18 @@ func main() {
 	// Example gateway, replace with the “real” GW you want
 	wantedGW, err := getWantedGW()
 	if err != nil {
-		redPrintf("need to know which gw to set: %v", err)
+		redPrintf("need to know which gw to set: %v\n", err)
 		return
 	} else {
 		fmt.Printf("Read gw '%s' from file '%s'\n", wantedGW, gwFile)
 	}
 	targetGW, err := ipv4ToUint32LE(wantedGW)
 	if err != nil {
-		redPrintf("Failed to convert wanted gw IP %s into uint32\n", wantedGW)
+		redPrintf("Failed to convert wanted gw IP %s into uint32: %v\n", wantedGW, err)
+		return
+	}
+	if targetGW == 0 || targetGW == ^uint32(0) {
+		redPrintf("The wanted gw %s (0.0.0.0 or 255.255.255.255) isn't a usable gateway address\n", wantedGW)
 		return
 	}
 
@@ -827,7 +839,7 @@ func main() {
 	}
 
 	// 1. Put Stdin into raw mode so we can capture Ctrl+R instantly (without hitting Enter)
-	// We keep ENABLE_PROCESSED_INPUT active so Ctrl+C still sends SIGINT to our channel.
+	// We also clear ENABLE_PROCESSED_INPUT, so Ctrl+C arrives as the plain byte 3 (handled in the loop below) instead of a signal.
 	var oldMode uint32
 	if err := windows.GetConsoleMode(windows.Stdin, &oldMode); err != nil {
 		redPrintf("Warning: GetConsoleMode failed, Ctrl+R raw-mode toggling won't work: %v\n", err)
@@ -846,9 +858,14 @@ func main() {
 	}
 
 	var isActive bool
+	// stateMu guards isActive/removeActiveGateway/removeDirectGWRoute: the console ctrl handler calls deactivate()
+	// on a different OS thread than the main loop's activate()/deactivate().
+	var stateMu sync.Mutex
 
 	// 2. Wrap routing logic into an activate closure
 	activate := func() {
+		stateMu.Lock()
+		defer stateMu.Unlock()
 		if err := clearPersistentGatewayForIndex(ifIndex); err != nil {
 			fmt.Println("Failed to delete persistent gateway(ie. the one set in LAN adapter settings, seen by 'route print' under 'Persistent Routes'), err:", err)
 			return //XXX: yes, we don't wanna continue if this fails
@@ -863,6 +880,8 @@ func main() {
 
 	// 3. Wrap cleanup logic into a deactivate closure
 	deactivate := func() {
+		stateMu.Lock()
+		defer stateMu.Unlock()
 		onlinkgatewayremoval(targetGW, ifIndex, isActive)
 		defaultgatewayremoval(targetGW, ifIndex, isActive)
 

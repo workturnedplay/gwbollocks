@@ -86,6 +86,6 @@ if "!ec!"=="0" (
 ) else (
     echo couldn't start it, exited with error code "!ec!"
     pause
-    exit !ec!
+    exit /b !ec!
 )
 

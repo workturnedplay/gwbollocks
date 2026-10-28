@@ -34,8 +34,8 @@ go build -ldflags="-H=windowsgui"
 ```
 
 Or try `build.bat`(no console) or `.\devbuild.bat`(yes console).  
-That gives you an `.exe`, you can run it and it has a systray icon, RMB->Exit to stop it.  
-Or, you can try `run.bat` which does the same thing(but Ctrl+C works too, to stop it), wrapped.  
+That gives you an `.exe`; it needs an elevated terminal (or start it via `runasadmin.bat`), and Ctrl+C in its console stops it (no systray icon yet).  
+Or, you can try `run.bat` which does the same thing, wrapped (it doesn't elevate, so use it from an already-elevated terminal).  
 
 ---
 

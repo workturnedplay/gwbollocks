@@ -37,6 +37,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -1728,8 +1729,6 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 // boolToUintptr performs an explicit conversion from a Go bool to a
 // Windows-compatible BOOL (uintptr(1) for true, uintptr(0) for false).
 // This is required because Go bools cannot be directly cast to numeric types.
-//
-//go:inline
 func boolToUintptr(b bool) uintptr {
 	if b {
 		return 1
@@ -2593,10 +2592,9 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 	return 0, "", fmt.Errorf("no TCP owner found for %s", clientAddr.String())
 }
 
-// serviceNameCache caches PID→service-names with a short TTL to avoid
-// hammering EnumServicesStatusEx on every packet under high concurrency.
-// This also eliminates the concurrent unsafe-buffer pressure that caused
-// the STATUS_ACCESS_VIOLATION crash under -race load. No, the cause was this: https://github.com/golang/go/issues/77975
+// serviceCacheEntry is one cached PID→service-names result, valid until expiresAt.
+// serviceCache exists to avoid hammering EnumServicesStatusEx on every packet under high concurrency.
+// (It is NOT a fix for the STATUS_ACCESS_VIOLATION crash under -race load, that was: https://github.com/golang/go/issues/77975)
 type serviceCacheEntry struct {
 	names     []string
 	expiresAt time.Time
@@ -2639,7 +2637,7 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 	// Fast path: check cache under lock.
 	serviceCacheMu.Lock()
 	if entry, ok := serviceCache[targetPID]; ok && time.Now().Before(entry.expiresAt) {
-		names := entry.names
+		names := slices.Clone(entry.names) // callers may mutate their copy; never hand out the cached backing array
 		serviceCacheMu.Unlock()
 		return names, nil
 	}
@@ -2661,7 +2659,7 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 		// instead of starting a duplicate, expensive enumeration ourselves.
 		serviceInFlightMu.Unlock()
 		<-inFlight.done
-		return inFlight.names, inFlight.err
+		return slices.Clone(inFlight.names), inFlight.err
 	}
 	inFlight := &serviceLookupInFlight{done: make(chan struct{})}
 	serviceInFlight[targetPID] = inFlight
@@ -2694,9 +2692,16 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 					delete(serviceCache, pid)
 				}
 			}
+			// Still full of unexpired entries: evict arbitrary ones so the map stays bounded.
+			for pid := range serviceCache {
+				if len(serviceCache) < serviceCacheMaxEntries {
+					break
+				}
+				delete(serviceCache, pid)
+			}
 		}
 		serviceCache[targetPID] = serviceCacheEntry{
-			names:     names,
+			names:     slices.Clone(names), // the leader returns 'names' itself, so the cache needs its own copy
 			expiresAt: time.Now().Add(serviceCacheTTL),
 		}
 		serviceCacheMu.Unlock()
@@ -2757,8 +2762,11 @@ func InjectConsoleKey(vkCode, scanCode uint16, char rune) error {
 		uintptr(1),
 		uintptr(unsafe.Pointer(&written)),
 	)
-	if res1.Failed() || written != 1 {
-		return fmt.Errorf("InjectConsoleKey failed, written %d, err: %w", written, res1.Err)
+	if res1.Failed() {
+		return fmt.Errorf("InjectConsoleKey failed, written %d: %w", written, res1.Err)
+	}
+	if written != 1 {
+		return fmt.Errorf("InjectConsoleKey: WriteConsoleInputW reported success but wrote %d event(s) instead of 1", written)
 	}
 
 	return nil
@@ -2859,7 +2867,16 @@ type GenericSafeFileWriter struct {
 	liveLogger     *atomic.Pointer[slog.Logger]
 }
 
+// sanitizeRetryParams clamps the retry knobs into a sane range: a negative maxRetries would make
+// 1+maxRetries <= 0 (RetryFileOp panics on that) and absurd values would overflow 1+maxRetries or
+// time.Duration(retryBackoffMs)*time.Millisecond.
+func sanitizeRetryParams(maxRetries, retryBackoffMs int) (int, int) {
+	const maxRetriesCap, maxBackoffMsCap = 1000, 60_000
+	return min(max(maxRetries, 0), maxRetriesCap), min(max(retryBackoffMs, 0), maxBackoffMsCap)
+}
+
 func NewGenericSafeFileWriter(extraSafety bool, maxRetries, retryBackoffMs int, liveLogger *atomic.Pointer[slog.Logger]) FileWriter {
+	maxRetries, retryBackoffMs = sanitizeRetryParams(maxRetries, retryBackoffMs)
 	return &GenericSafeFileWriter{
 		extraSafety:    extraSafety,
 		maxRetries:     maxRetries,
@@ -3228,6 +3245,7 @@ type win11SafeFileWriter struct {
 }
 
 func NewWin11SafeFileWriter(extraSafety bool, maxRetries, retryBackoffMs int, liveLogger *atomic.Pointer[slog.Logger]) FileWriter {
+	maxRetries, retryBackoffMs = sanitizeRetryParams(maxRetries, retryBackoffMs)
 	return &win11SafeFileWriter{
 		extraSafety:    extraSafety,
 		maxRetries:     maxRetries,
@@ -3376,15 +3394,13 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 func (fw *GenericSafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
 	fw.paramsMu.Lock()
 	defer fw.paramsMu.Unlock()
-	fw.maxRetries = maxRetries
-	fw.retryBackoffMs = retryBackoffMs
+	fw.maxRetries, fw.retryBackoffMs = sanitizeRetryParams(maxRetries, retryBackoffMs)
 }
 
 func (fw *win11SafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
 	fw.paramsMu.Lock()
 	defer fw.paramsMu.Unlock()
-	fw.maxRetries = maxRetries
-	fw.retryBackoffMs = retryBackoffMs
+	fw.maxRetries, fw.retryBackoffMs = sanitizeRetryParams(maxRetries, retryBackoffMs)
 }
 
 // Hooks for testing. In production, these point to the standard OS/wincoe functions.
@@ -3738,7 +3754,7 @@ func GetLastError() error {
 	return windows.GetLastError() //nolint:wrapcheck //on-purpose wrapper over this! kept here on purpose but never reached!
 }
 
-// SetLastError wraps windows.GetLastError.
+// SetLastError is a deliberately unusable stub (it always panics).
 //
 // Deprecated: Do not call this. Go erases thread-local error state prior to
 // syscall execution(ie. runs SetLastError(0)). Always read the 3rd return value (err) from LazyProc.Call().
@@ -3762,7 +3778,7 @@ const (
 // Return 1 (TRUE) if the event was handled, or 0 (FALSE) to pass it to the next handler.
 type ConsoleCtrlHandler func(ctrlType uint32) uintptr
 
-// RegisterCtrlHandler registers or unregisters a custom Windows console control handler.
+// setCtrlHandler registers or unregisters a custom Windows console control handler.
 // Pass true to add the handler (equivalent to passing 1), or false to remove it.
 //
 // The handler argument is expected to be a function with one uintptr-sized result. The function must not have arguments with size larger than the size of uintptr.
@@ -3776,12 +3792,10 @@ type ConsoleCtrlHandler func(ctrlType uint32) uintptr
 // is never garbage-collected. Passing dynamic closures will eventually exhaust Go's internal
 // callback pool (~2,000 max) and panic the runtime. Named functions are cached and memory-safe.
 func setCtrlHandler(handler ConsoleCtrlHandler, add bool) WinResult {
-	var addVal uintptr = 0
-	if add {
-		addVal = 1
+	if handler == nil {
+		return WinResult{Err: errors.New("setCtrlHandler: nil handler")}
 	}
-
-	return procSetConsoleCtrlHandler.Call(windows.NewCallback(handler), addVal)
+	return procSetConsoleCtrlHandler.Call(windows.NewCallback(handler), boolToUintptr(add))
 }
 
 // RegisterCtrlHandler registers a custom Windows console control handler.
@@ -4075,8 +4089,6 @@ const DWMWA_CLOAKED = 14
 // to a monitor's work-area edge) should use the difference between this and
 // GetWindowRect rather than GetWindowRect alone, or the alignment will
 // visually undershoot by that padding on three of the four sides.
-//
-//go:uintptrescapes
 func DwmGetExtendedFrameBounds(hwnd windows.Handle) (RECT, error) {
 	var r RECT
 	res := procDwmGetWindowAttribute.Call(
@@ -4461,11 +4473,7 @@ func DrawText(hdc windows.Handle, text *uint16, length int32, rect *RECT, format
 // 1 (TRUE) tells Windows: "Clear the old drawing/background first so we can draw a fresh frame."
 // * 0 (FALSE) would mean leave whatever is currently drawn on the screen intact underneath, which is typically only used if you are drawing over it completely or doing custom double-buffered rendering where you manage every single pixel yourself.
 func InvalidateRect(hwnd windows.Handle, rect *RECT, erase bool) WinResult {
-	var erasePtr uintptr
-	if erase {
-		erasePtr = 1
-	}
-	return procInvalidateRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(rect)), erasePtr)
+	return procInvalidateRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(rect)), boolToUintptr(erase))
 }
 
 // HasUpdateRegion reports whether hwnd currently has a non-empty update
@@ -5011,13 +5019,10 @@ const (
 // CreateWindowEx creates an overlapped, pop-up, or child window with an extended window style.
 func CreateWindowEx(
 	dwExStyle uint32,
-	lpClassName *uint16,
-	lpWindowName *uint16,
+	lpClassName, lpWindowName *uint16,
 	dwStyle uint32,
 	x, y, nWidth, nHeight int32,
-	hWndParent windows.Handle,
-	hMenu windows.Handle,
-	hInstance windows.Handle,
+	hWndParent, hMenu, hInstance windows.Handle,
 	lpParam unsafe.Pointer,
 ) WinResult {
 	res := procCreateWindowEx.Call(
@@ -5119,8 +5124,8 @@ func TrackPopupMenuWithoutReturnCmd(
 		panic2("BUG: you called TrackPopupMenuWithoutReturnCmd with TPM_RETURNCMD!")
 		panic(nil)
 	}
-	// Ensure TPM_RETURNCMD is NOT set
-	uFlags &^= TPM_RETURNCMD
+	//// Ensure TPM_RETURNCMD is NOT set, it isn't because it panics above if it is!
+	//uFlags &^= TPM_RETURNCMD
 
 	return procTrackPopupMenuBool.Call(
 		uintptr(hMenu),
@@ -5256,14 +5261,10 @@ func InitDPIAwareness(loggerFunction func(format string, args ...any)) {
 //
 // if fAttach is false it means detach.
 func AttachThreadInput(idAttach, idAttachTo uint32, fAttach bool) WinResult {
-	var attach uintptr
-	if fAttach {
-		attach = 1
-	}
 	return procAttachThreadInput.Call(
 		uintptr(idAttach),
 		uintptr(idAttachTo),
-		attach,
+		boolToUintptr(fAttach),
 	)
 }
 
@@ -5724,13 +5725,9 @@ func GetWindowLongPtrW(hwnd windows.Handle, nIndex int32) WinResult { //uintptr 
 //
 // bInitialOwner should be true aka "You must acquire ownership of the mutex before you can release it." otherwise you cannot call ReleaseMutex on it, unless you use WaitForSingleObject (currently not defined in wincoe!)
 func CreateMutex(lpMutexAttributes unsafe.Pointer, bInitialOwner bool, lpName *uint16) (windows.Handle, WinResult) {
-	var initialOwner uintptr
-	if bInitialOwner {
-		initialOwner = 1
-	}
 	res := procCreateMutex.Call(
 		uintptr(lpMutexAttributes),
-		initialOwner,
+		boolToUintptr(bInitialOwner),
 		uintptr(unsafe.Pointer(lpName)),
 	)
 	return windows.Handle(res.R1), res
@@ -5859,13 +5856,9 @@ func AdjustTokenPrivileges(
 	previousState *TOKEN_PRIVILEGES,
 	returnLength *uint32,
 ) WinResult {
-	var disableAll uintptr
-	if disableAllPrivileges {
-		disableAll = 1
-	}
 	return procAdjustTokenPrivileges.Call(
 		uintptr(tokenHandle),
-		disableAll,
+		boolToUintptr(disableAllPrivileges),
 		uintptr(unsafe.Pointer(newState)),
 		uintptr(bufferLength),
 		uintptr(unsafe.Pointer(previousState)),
@@ -6431,6 +6424,10 @@ var ReservedFileNames = map[string]struct{}{
 	"COM6": {}, "COM7": {}, "COM8": {}, "COM9": {},
 	"LPT1": {}, "LPT2": {}, "LPT3": {}, "LPT4": {}, "LPT5": {},
 	"LPT6": {}, "LPT7": {}, "LPT8": {}, "LPT9": {},
+	"COM0": {}, "LPT0": {},
+	"COM¹": {}, "COM²": {}, "COM³": {},
+	"LPT¹": {}, "LPT²": {}, "LPT³": {},
+	"CONIN$": {}, "CONOUT$": {},
 }
 
 // IsWindowsReservedFileName checks if a filename uses a Windows reserved device name.
@@ -6442,9 +6439,12 @@ func IsWindowsReservedFileName(name string) bool {
 	// Windows device names remain reserved when followed by an extension:
 	// CON.txt, COM1.log, NUL.foo, etc. Only the device-name stem matters.
 	stem := baseName
-	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
-		stem = stem[:dot]
+	// '.' starts an extension and ':' an NTFS alternate data stream ("NUL:foo" is still the NUL device);
+	// trailing spaces before either are stripped by Windows too ("NUL .txt").
+	if cut := strings.IndexAny(stem, ".:"); cut >= 0 {
+		stem = stem[:cut]
 	}
+	stem = strings.TrimRight(stem, " ")
 
 	_, reserved := ReservedFileNames[stem]
 	return reserved

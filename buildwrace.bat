@@ -2,7 +2,8 @@
 rem 1. Prevent the current working directory from taking precedence over PATH, doesn't work with eg. "start go.exe"
 set "NoDefaultCurrentDirectoryInExePath=1"
 ::if running as admin must get back to current dir:
-cd /d %~dp0
+cd /d "%~dp0"
+setlocal
 
 echo building with race detector...
 
@@ -14,6 +15,11 @@ rem go env CC
 rem go env GOARCH
 rem go env GORACE
 gcc --version
+if errorlevel 1 (
+  echo ERROR: gcc not found in PATH, the race detector needs cgo.
+  pause
+  exit /b 1
+)
 rem gcc (MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r7) 15.2.0
 
 set "BUILD_WITH_RACE_DETECTOR=-race"
