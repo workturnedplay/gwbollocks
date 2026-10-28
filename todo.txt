@@ -1,14 +1,14 @@
 todo:
 * update the .bat files so they fix issues that are already fixed in winbollocks and dnsbollocks
-* on sleep/wake resetting of gw(and setting it back on wake) isn't implemented yet (reboot/shutdown/logoff are handled by consoleCtrlHandler).
+* this appears pointless though: on sleep/wake resetting of gw(and setting it back on wake) isn't implemented yet (reboot/shutdown/logoff are handled by consoleCtrlHandler).
 * set the other keys like EnableDHCP=0 and DisableDhcpOnConnect=1 etc. in registry to match this non DHCP thing or maybe it works with DHCP too?
 * check this folder reg key for other things I should set: Computer\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}\
-* also if DHCP is enabled, then this wouldn't work right, do proper warn and exit or so.
 * warn if legacy Computer\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes isn't empty!
-* proper error checking
-* avoid all compilation warnings!
-* exit codes
 
 done:
 //* make it exit on keypress not on Enter!
 //* empty DefaultGateway and DefaultGatewayMetric in the interface's registry key (clearPersistentGatewayForIndex)
+//* also if DHCP is enabled, then this wouldn't work right, do proper warn and exit or so.
+//* proper error checking
+//* avoid all compilation warnings!
+//* exit codes
